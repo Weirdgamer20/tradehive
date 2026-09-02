@@ -1,0 +1,11 @@
+[package]
+name = "th-domain"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+chrono.workspace = true
+chrono-tz.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+uuid.workspace = true

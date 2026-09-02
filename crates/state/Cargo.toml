@@ -1,0 +1,9 @@
+[package]
+name="th-state"
+version.workspace=true
+edition.workspace=true
+license.workspace=true
+[dependencies]
+chrono.workspace=true
+serde.workspace=true
+thiserror.workspace=true

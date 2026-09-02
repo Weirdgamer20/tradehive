@@ -1,0 +1,24 @@
+[Unit]
+Description=TradingHive Rust Trading Runtime
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tradinghive
+Group=tradinghive
+WorkingDirectory=/opt/trading-hive
+EnvironmentFile=/etc/trading-hive/production.env
+ExecStart=/opt/trading-hive/bin/trading-hive live-paper --symbols SPY,QQQ
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/trading-hive/data
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

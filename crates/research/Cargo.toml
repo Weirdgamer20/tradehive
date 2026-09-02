@@ -1,0 +1,14 @@
+[package]
+name="th-research"
+version.workspace=true
+edition.workspace=true
+license.workspace=true
+[dependencies]
+chrono.workspace=true
+serde.workspace=true
+thiserror.workspace=true
+th-domain={path="../domain"}
+th-intelligence={path="../intelligence"}
+th-hive={path="../hive"}
+th-backtest={path="../backtest"}
+sha2.workspace=true

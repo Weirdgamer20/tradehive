@@ -1,0 +1,20 @@
+from pathlib import Path
+root=Path(__file__).resolve().parents[1]
+checks=[]
+def check(name, ok): checks.append((name,bool(ok)))
+hive=(root/'crates/hive/src/lib.rs').read_text(); bot=(root/'crates/bot/src/lib.rs').read_text(); deploy=(root/'crates/deployment/src/lib.rs').read_text(); strategy=(root/'crates/strategy/src/lib.rs').read_text(); cli=(root/'crates/cli/src/main.rs').read_text(); ci=(root/'.github/workflows/ci.yml').read_text()
+check('30 seed strategies','ids.into_iter().take(30)' in strategy)
+check('120-180 expiry gate','m>=policy.min_expiry_minutes' in hive and 'm<=policy.max_expiry_minutes' in hive)
+check('Hive does not size', 'quantity:0' in deploy and 'entry_limit:0.0' in deploy and 'stop_loss_pct:0.0' in deploy)
+check('Bot sizes from live ask','calculate_worker_quantity' in bot and 'quote.ask' in bot)
+check('Stop loss is ENV','TRADING_STOP_LOSS_PCT' in bot)
+check('180-minute horizon','bot_max_hold_minutes!=180' in bot and 'bot_max_hold_minutes:180' in bot)
+check('Confidence allocation','confidence_allocate' in hive and 'total*c/denom' in hive)
+check('dynamic strategy generation','next_strategy_id' in hive and 'generated_from_q' in hive and 'id:"STRAT-31"' not in hive)
+check('STRAT-31 validation','validate_generated_strategy' in hive)
+check('Live option-chain validation','OptionChainValidate' in cli and 'provider.option_chain' in cli)
+check('Paper execution smoke','PaperSmoke' in cli and 'PaperBroker::new' in cli)
+check('Cross-platform CI',all(x in ci for x in ['ubuntu-latest','windows-latest','macos-latest']))
+check('Workspace test CI','cargo test --workspace --all-features' in ci)
+for n,ok in checks: print(('PASS' if ok else 'FAIL')+' '+n)
+raise SystemExit(1 if not all(ok for _,ok in checks) else 0)

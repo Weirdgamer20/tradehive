@@ -1,0 +1,45 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/domain",
+  "crates/market-data",
+  "crates/strategy",
+  "crates/risk",
+  "crates/execution",
+  "crates/storage",
+  "crates/backtest",
+  "crates/hive",
+  "crates/bot",
+  "crates/cli",
+  "crates/intelligence", "crates/memory", "crates/state", "crates/operations", "crates/research", "crates/deployment", "crates/reconcile",
+  "crates/sentinel",
+  "crates/options-data",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.9.0"
+authors = ["TradingHive"]
+license = "MIT"
+
+[workspace.dependencies]
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+dotenvy = "0.15"
+clap = { version = "4.5", features = ["derive", "env"] }
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "sync"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+getrandom = { version = "0.2", features = ["std"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
