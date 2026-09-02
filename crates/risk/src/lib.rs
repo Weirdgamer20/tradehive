@@ -6,22 +6,14 @@ use thiserror::Error;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RiskLimits {
-    pub max_order_notional: f64,
-    pub max_total_notional: f64,
-    pub max_daily_loss: f64,
-    pub max_positions: u32,
-    pub max_single_position_qty: u32,
-    pub max_spread_bps: f64,
-    pub max_symbol_exposure: f64,
-}
+pub struct RiskLimits { pub max_order_notional: f64, pub max_total_notional: f64, pub max_daily_loss: f64, pub max_positions: u32, pub max_single_position_qty: u32, pub max_spread_bps: f64, pub max_symbol_exposure: f64 }
 impl Default for RiskLimits {
-    fn default() -> Self { Self { max_order_notional: 1000.0, max_total_notional: 5000.0, max_daily_loss: 250.0, max_positions: 10, max_single_position_qty: 10, max_spread_bps: 250.0, max_symbol_exposure: 1500.0 } }
+    fn default() -> Self { Self { max_order_notional: 0.0, max_total_notional: 0.0, max_daily_loss: 0.0, max_positions: 0, max_single_position_qty: 0, max_spread_bps: 0.0, max_symbol_exposure: 0.0 } }
 }
 impl RiskLimits {
     pub fn from_env() -> Result<Self, RiskError> {
         let required = |name: &str| std::env::var(name).map_err(|_| RiskError::Invalid(format!("{name} missing")));
-        let mut limits = Self {
+        let limits = Self {
             max_order_notional: required("RISK_MAX_ORDER_NOTIONAL")?.parse().map_err(|_| RiskError::Invalid("RISK_MAX_ORDER_NOTIONAL invalid".into()))?,
             max_total_notional: required("RISK_MAX_TOTAL_NOTIONAL")?.parse().map_err(|_| RiskError::Invalid("RISK_MAX_TOTAL_NOTIONAL invalid".into()))?,
             max_daily_loss: required("RISK_MAX_DAILY_LOSS")?.parse().map_err(|_| RiskError::Invalid("RISK_MAX_DAILY_LOSS invalid".into()))?,
