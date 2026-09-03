@@ -33,6 +33,9 @@ enum Commands {
 #[tokio::main]
 async fn main() {
     dotenvy::dotenv().ok();
+    dotenvy::from_filename(".env").ok();
+    dotenvy::from_filename("config/.env").ok();
+    dotenvy::from_filename("config/example.env").ok();
     if let Err(e) = run().await {
         eprintln!("ERROR: {e}");
         std::process::exit(1);
