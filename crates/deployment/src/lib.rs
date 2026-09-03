@@ -162,6 +162,18 @@ impl BotFleet {
     pub fn retire(&mut self, id: &str) -> Result<(), DeploymentError> {
         self.set(id, BotStatus::Retired)
     }
+    pub fn activate_all(&mut self) {
+        for b in &mut self.bots {
+            if b.status != BotStatus::Retired {
+                b.status = BotStatus::Active;
+            }
+        }
+    }
+    pub fn retire_all(&mut self) {
+        for b in &mut self.bots {
+            b.status = BotStatus::Retired;
+        }
+    }
     pub fn active(&self) -> Vec<&BotSpec> {
         self.bots
             .iter()

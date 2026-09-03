@@ -36,6 +36,8 @@ pub struct RuntimeConfig {
     pub stop_loss_pct: f64,
     pub take_profit_pct: f64,
     pub bot_max_hold_minutes: u32,
+    pub candidate_universe: Vec<String>,
+    pub max_universe_size: usize,
 }
 impl Default for RuntimeConfig {
     fn default() -> Self {
@@ -51,6 +53,8 @@ impl Default for RuntimeConfig {
             stop_loss_pct: 0.0,
             take_profit_pct: 0.0,
             bot_max_hold_minutes: 180,
+            candidate_universe: vec!["SPY".into(), "QQQ".into(), "IWM".into()],
+            max_universe_size: 2,
         }
     }
 }
@@ -79,6 +83,25 @@ impl RuntimeConfig {
         if let Ok(v) = std::env::var("TRADING_TAKE_PROFIT_PCT") {
             if let Ok(p) = v.parse::<f64>() {
                 c.take_profit_pct = p;
+            }
+        }
+        if let Ok(v) = std::env::var("HIVE_CANDIDATE_UNIVERSE")
+            .or_else(|_| std::env::var("HIVE_MARKET_UNIVERSE"))
+            .or_else(|_| std::env::var("TRADING_UNIVERSE"))
+        {
+            let syms = v
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_uppercase)
+                .collect::<Vec<_>>();
+            if !syms.is_empty() {
+                c.candidate_universe = syms;
+            }
+        }
+        if let Ok(v) = std::env::var("HIVE_MAX_UNIVERSE_SIZE") {
+            if let Ok(n) = v.parse::<usize>() {
+                c.max_universe_size = n;
             }
         }
         c.validate()?;
@@ -338,6 +361,10 @@ pub struct TradingRuntime<B: Broker, P: MarketDataProvider> {
     pub health: RuntimeHealth,
     pub control_epoch: u64,
     pub json_history: JsonHistoryStore,
+    pub market_clock: th_domain::MarketSessionClock,
+    pub current_session_id: Option<String>,
+    pub active_universe: Vec<String>,
+    pub phase_override: Option<SessionPhase>,
 }
 impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
     pub fn new(cfg: RuntimeConfig, broker: B, provider: P) -> Result<Self, RuntimeError> {
@@ -462,6 +489,10 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
             health: RuntimeHealth::Healthy,
             control_epoch: 0,
             json_history,
+            market_clock: th_domain::MarketSessionClock::from_env(),
+            current_session_id: None,
+            active_universe: Vec::new(),
+            phase_override: None,
             cfg: RuntimeConfig {
                 config_version: active_version,
                 ..cfg
@@ -473,6 +504,13 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
     }
     pub fn phase(&self) -> SessionPhase {
         self.phase_at(Utc::now())
+    }
+    pub fn market_session_phase(&self, dt: DateTime<Utc>) -> SessionPhase {
+        if let Some(p) = self.phase_override {
+            p
+        } else {
+            self.market_clock.phase_at(dt)
+        }
     }
     pub fn halt(&mut self) {
         self.active = false;
@@ -1263,6 +1301,15 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
         Ok(report.matched)
     }
     fn prior_q_from_active(&self) -> Option<QLearning> {
+        if let Ok(Some(latest)) = self.json_history.latest_rl_session() {
+            if let Ok(entries) = serde_json::from_value::<Vec<th_hive::QEntry>>(
+                serde_json::Value::Array(latest.q_table_snapshot),
+            ) {
+                if !entries.is_empty() {
+                    return Some(QLearning::from_entries(&entries));
+                }
+            }
+        }
         self.store
             .active_config()
             .ok()
@@ -1409,6 +1456,52 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
             open_trades: self.open_trades.len(),
         })
     }
+    pub async fn select_trading_universe(
+        &mut self,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<String>, RuntimeError> {
+        println!(
+            "UNIVERSE_SELECTION_STARTED candidates={:?}",
+            self.cfg.candidate_universe
+        );
+        let mut liquid_symbols: Vec<(String, f64)> = Vec::new();
+
+        for sym in &self.cfg.candidate_universe {
+            let end = now;
+            let start = end - chrono::Duration::days(5);
+            match self.provider.bars(sym, start, end).await {
+                Ok(bars) if !bars.is_empty() => {
+                    let total_vol: f64 = bars.iter().map(|b| b.volume).sum();
+                    self.bars.insert(sym.clone(), bars);
+                    liquid_symbols.push((sym.clone(), total_vol));
+                }
+                Ok(_) => {
+                    println!("UNIVERSE_CANDIDATE_SKIPPED symbol={sym} reason=NO_BARS");
+                }
+                Err(e) => {
+                    println!("UNIVERSE_CANDIDATE_ERROR symbol={sym} error={e}");
+                }
+            }
+        }
+
+        if liquid_symbols.is_empty() {
+            return Err(RuntimeError::Market(
+                "No valid market data available for any candidate symbols; failing closed".into(),
+            ));
+        }
+
+        liquid_symbols.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let selected: Vec<String> = liquid_symbols
+            .into_iter()
+            .take(self.cfg.max_universe_size.max(1))
+            .map(|(s, _)| s)
+            .collect();
+
+        println!("UNIVERSE_SELECTED symbols={:?}", selected);
+        self.active_universe = selected.clone();
+        Ok(selected)
+    }
+
     pub async fn ensure_bots_manufactured(
         &mut self,
         symbols: &[String],
@@ -1452,24 +1545,9 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
         }
 
         if histories.is_empty() {
-            for symbol in symbols {
-                let mut bs = Vec::with_capacity(120);
-                let p = 500.0;
-                for i in 0..120 {
-                    let ts = now - chrono::Duration::minutes((120 - i) as i64);
-                    bs.push(th_domain::Bar {
-                        symbol: symbol.clone(),
-                        ts,
-                        open: p + (i as f64 * 0.05),
-                        high: p + (i as f64 * 0.05) + 0.2,
-                        low: p + (i as f64 * 0.05) - 0.2,
-                        close: p + (i as f64 * 0.05) + 0.1,
-                        volume: 1000.0,
-                    });
-                }
-                self.bars.insert(symbol.clone(), bs.clone());
-                histories.insert(symbol.clone(), bs);
-            }
+            return Err(RuntimeError::Market(
+                "Alpaca returned no historical market bars for universe; failing closed".into(),
+            ));
         }
 
         let trade_records = self
@@ -1513,14 +1591,10 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
 
         let mut chains = HashMap::new();
         for symbol in histories.keys() {
-            if let Ok(chain) = self.provider.option_chain(symbol, now).await {
-                chains.insert(symbol.clone(), chain);
-            } else {
-                chains.insert(
-                    symbol.clone(),
-                    th_market_data::synthetic_option_chain(symbol, 500.0, now),
-                );
-            }
+            let chain = self.provider.option_chain(symbol, now).await.map_err(|e| {
+                RuntimeError::Market(format!("Failed to retrieve option chain for {symbol}: {e}"))
+            })?;
+            chains.insert(symbol.clone(), chain);
         }
 
         let expiry_policy = th_domain::OptionExpiryPolicy::from_env();
@@ -1730,160 +1804,402 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
         Ok(staged && !plans.is_empty())
     }
 
+    pub async fn execute_pre_market(
+        &mut self,
+        session_id: &str,
+        symbols: &[String],
+        now: DateTime<Utc>,
+    ) -> Result<Vec<String>, RuntimeError> {
+        println!("PRE_MARKET_ANALYSIS_STARTED session_id={session_id}");
+
+        let prior_rl = self.json_history.latest_rl_session().unwrap_or(None);
+        let trade_records = self
+            .store
+            .trade_records_since(&(now - chrono::Duration::days(7)).to_rfc3339())
+            .unwrap_or_default();
+        let portfolio = self
+            .execution
+            .broker()
+            .await
+            .map(|a| a.equity)
+            .unwrap_or(0.0);
+        println!(
+            "PREVIOUS_SESSION_LOADED prior_rl={} trade_records={} equity={:.2}",
+            prior_rl.is_some(),
+            trade_records.len(),
+            portfolio
+        );
+        let q_entries = prior_rl
+            .as_ref()
+            .map(|r| r.q_table_snapshot.len())
+            .unwrap_or(0);
+        println!("RL_STATE_LOADED entries={}", q_entries);
+
+        let selected = if symbols.is_empty() {
+            self.select_trading_universe(now).await?
+        } else {
+            symbols.to_vec()
+        };
+
+        println!("BOT_MANUFACTURING_STARTED session_id={session_id}");
+        self.ensure_bots_manufactured(&selected).await?;
+        println!(
+            "BOT_MANUFACTURING_COMPLETED session_id={session_id} bots={}",
+            self.bot_plans.len()
+        );
+
+        Ok(selected)
+    }
+
+    pub async fn activate_market_open(&mut self, session_id: &str) -> Result<(), RuntimeError> {
+        if !self.reconcile().await? {
+            println!("SESSION_ERROR reconciliation failed at market open");
+            return Err(RuntimeError::ReconciliationFailed);
+        }
+        if !self.execution.is_killed() {
+            self.active = true;
+            self.health = RuntimeHealth::Healthy;
+            self.fleet.activate_all();
+            println!("BOTS_ACTIVATED count={}", self.bot_plans.len());
+            println!("MARKET_OPEN session_id={session_id}");
+            println!("TRADING_ENABLED session_id={session_id}");
+        }
+        Ok(())
+    }
+
+    pub async fn execute_market_closing(&mut self, session_id: &str) -> Result<(), RuntimeError> {
+        println!("MARKET_CLOSING session_id={session_id}");
+        self.active = false;
+        println!("TRADING_DISABLED session_id={session_id}");
+        Ok(())
+    }
+
+    pub async fn execute_post_market(
+        &mut self,
+        session_id: &str,
+        symbols: &[String],
+        now: DateTime<Utc>,
+    ) -> Result<(), RuntimeError> {
+        println!("POST_MARKET session_id={session_id}");
+
+        let _ = self.reconcile().await;
+        let account = self.execution.broker().await.ok();
+        let equity = account.as_ref().map(|a| a.equity).unwrap_or(0.0);
+        let cash = account.as_ref().map(|a| a.cash).unwrap_or(0.0);
+
+        let dataset = serde_json::json!({
+            "session_id": session_id,
+            "market_date": now.with_timezone(&self.market_clock.config.timezone).format("%Y-%m-%d").to_string(),
+            "timestamp": now.to_rfc3339(),
+            "symbols": symbols,
+            "bot_count": self.bot_plans.len(),
+            "open_trades": self.open_trades.len(),
+            "trades_opened": self.stats.trades_opened,
+            "trades_closed": self.stats.trades_closed,
+            "realized_pnl": self.stats.realized_pnl,
+            "rejected_orders": self.stats.rejected_orders,
+            "account_equity": equity,
+            "account_cash": cash,
+            "status": "FINALIZED"
+        });
+
+        let _ = self.json_history.record_session_dataset(dataset.clone());
+        let _ = self.store.event("SESSION_FINALIZED", &dataset);
+
+        let count = self.bot_plans.len();
+        self.fleet.retire_all();
+        self.bot_plans.clear();
+        self.open_trades.clear();
+
+        println!("BOTS_RETIRED count={}", count);
+        println!("SESSION_FINALIZED session_id={session_id}");
+        Ok(())
+    }
+
+    pub async fn execute_learning(
+        &mut self,
+        session_id: &str,
+        symbols: &[String],
+        now: DateTime<Utc>,
+    ) -> Result<(), RuntimeError> {
+        println!("RL_STARTED session_id={session_id}");
+        let trade_records = self
+            .store
+            .trade_records_since(&(now - chrono::Duration::hours(24)).to_rfc3339())
+            .unwrap_or_default();
+
+        if trade_records.is_empty() {
+            println!(
+                "RL_STATUS=INSUFFICIENT_DATA session_id={session_id} reason=no_session_trades"
+            );
+            return Ok(());
+        }
+
+        let mut histories = HashMap::new();
+        for sym in symbols {
+            if let Some(bars) = self.bars.get(sym) {
+                histories.insert(sym.clone(), bars.clone());
+            }
+        }
+
+        if histories.is_empty() {
+            println!(
+                "RL_STATUS=INSUFFICIENT_DATA session_id={session_id} reason=no_market_histories"
+            );
+            return Ok(());
+        }
+
+        let bundle = run_analysis_with_q_and_trades(
+            histories.clone(),
+            self.prior_q_from_active(),
+            &trade_records,
+        );
+
+        let base_seeds = th_strategy::StrategyRegistry::new().seed_ids();
+        let seed_before = self
+            .json_history
+            .latest_seed_snapshot()
+            .unwrap_or_default()
+            .unwrap_or_else(|| {
+                base_seeds
+                    .iter()
+                    .map(|id| serde_json::json!({"strategy_id": id, "type": "seed"}))
+                    .collect()
+            });
+        let mut seed_after = seed_before.clone();
+        for sa in &bundle.symbols {
+            if let Some(g) = &sa.report.generated_strategy {
+                if g.validation.as_ref().map(|v| v.accepted).unwrap_or(false) {
+                    seed_after.push(serde_json::json!({
+                        "strategy_id": g.blueprint.id,
+                        "type": "rl_promoted",
+                        "blueprint": g.blueprint
+                    }));
+                }
+            }
+        }
+
+        let _ = th_hive::persist_rl_history(
+            &self.json_history,
+            &bundle,
+            serde_json::json!({"trade_records_used": trade_records.len()}),
+            seed_before,
+            seed_after,
+            serde_json::json!({"symbols": histories.keys().collect::<Vec<_>>()}),
+        );
+
+        println!("RL_COMPLETED session_id={session_id}");
+        println!("RL_STATE_PERSISTED session_id={session_id}");
+        Ok(())
+    }
+
     pub async fn run_session(
         &mut self,
         symbols: &[String],
         max_ticks: Option<usize>,
     ) -> Result<SessionStats, RuntimeError> {
-        if symbols.is_empty() {
-            return Err(RuntimeError::InvalidConfig("no symbols configured".into()));
-        }
-
         let now = Utc::now();
-        let phase = self.phase_at(now);
-        let start = current_analysis_start(&self.cfg, now);
-        let deadline = research_deadline(&self.cfg, start);
+        let mut current_session_date = now
+            .with_timezone(&self.market_clock.config.timezone)
+            .format("%Y%m%d")
+            .to_string();
+        let mut session_id = format!("SESSION-{}", current_session_date);
+        self.current_session_id = Some(session_id.clone());
 
-        println!(
-            "SESSION_STARTED phase={:?} symbols={:?} analysis_start={} deadline={:?}",
-            phase, symbols, start, deadline
-        );
+        let initial_phase = self.market_session_phase(now);
+        println!("SESSION_PHASE_CHANGED from=NONE to={:?}", initial_phase);
+        let mut last_phase = Some(initial_phase);
 
-        self.ensure_bots_manufactured(symbols).await?;
+        let mut active_symbols = if !symbols.is_empty() {
+            symbols.to_vec()
+        } else {
+            match self.select_trading_universe(now).await {
+                Ok(s) => s,
+                Err(e) => {
+                    println!("INITIAL_UNIVERSE_SELECTION_DEFERRED reason={e}");
+                    vec![]
+                }
+            }
+        };
 
-        if !self.reconcile().await? {
-            println!("SESSION_ERROR reconciliation failed on startup");
-            return Err(RuntimeError::ReconciliationFailed);
+        let mut pre_market_done = false;
+        let mut open_done = false;
+        let mut closing_done = false;
+        let mut post_market_done = false;
+        let mut learning_done = false;
+
+        match initial_phase {
+            SessionPhase::PreMarket => {
+                active_symbols = self
+                    .execute_pre_market(&session_id, &active_symbols, now)
+                    .await?;
+                pre_market_done = true;
+            }
+            SessionPhase::MarketOpen | SessionPhase::Trading => {
+                if active_symbols.is_empty() {
+                    active_symbols = self.select_trading_universe(now).await?;
+                }
+                self.ensure_bots_manufactured(&active_symbols).await?;
+                self.activate_market_open(&session_id).await?;
+                open_done = true;
+            }
+            SessionPhase::MarketClosing => {
+                self.execute_market_closing(&session_id).await?;
+                closing_done = true;
+            }
+            SessionPhase::PostMarket => {
+                self.execute_post_market(&session_id, &active_symbols, now)
+                    .await?;
+                post_market_done = true;
+            }
+            SessionPhase::Learning => {
+                self.execute_learning(&session_id, &active_symbols, now)
+                    .await?;
+                learning_done = true;
+            }
+            SessionPhase::WaitingForNextSession | SessionPhase::Analysis => {
+                self.active = false;
+                println!("WAITING_FOR_NEXT_SESSION session_id={session_id}");
+                println!("HIVE_HEARTBEAT status=WAITING_FOR_NEXT_SESSION market_open=false active_bots=0");
+            }
         }
 
-        if phase == SessionPhase::Trading && !self.execution.is_killed() {
-            self.active = true;
-            self.health = RuntimeHealth::Healthy;
-        }
-
-        println!(
-            "MARKET_DATA_READY active={} health={:?} open_trades={}",
-            self.active,
-            self.health,
-            self.open_trades.len()
-        );
-
-        let mut last_phase = phase;
         let mut tick_count: usize = 0;
 
         loop {
             let now = Utc::now();
-            let current_phase = self.phase_at(now);
-
-            if current_phase != last_phase {
-                self.store
-                    .event(
-                        "SESSION_PHASE",
-                        &serde_json::json!({
-                            "from": format!("{:?}", last_phase),
-                            "to": format!("{:?}", current_phase),
-                            "at": now
-                        }),
-                    )
-                    .map_err(|e| RuntimeError::Storage(e.to_string()))?;
-
-                if current_phase == SessionPhase::Trading {
-                    if !self.reconcile().await? {
-                        return Err(RuntimeError::ReconciliationFailed);
-                    }
-                    if !self.execution.is_killed() {
-                        self.active = true;
-                        self.health = RuntimeHealth::Healthy;
-                    }
-                } else {
-                    self.active = false;
+            let new_date = now
+                .with_timezone(&self.market_clock.config.timezone)
+                .format("%Y%m%d")
+                .to_string();
+            if new_date != current_session_date {
+                current_session_date = new_date;
+                session_id = format!("SESSION-{}", current_session_date);
+                self.current_session_id = Some(session_id.clone());
+                pre_market_done = false;
+                open_done = false;
+                closing_done = false;
+                post_market_done = false;
+                learning_done = false;
+                if symbols.is_empty() {
+                    active_symbols.clear();
                 }
-                last_phase = current_phase;
+                println!("DAY_ROLLED_OVER new_session_id={session_id}");
             }
 
-            if current_phase == SessionPhase::Analysis {
-                let a_start = current_analysis_start(&self.cfg, now);
-                let a_deadline = research_deadline(&self.cfg, a_start);
-                let key = format!("analysis_completed:{}", a_start.timestamp());
+            let current_phase = self.market_session_phase(now);
+            if Some(current_phase) != last_phase {
+                if let Some(prev) = last_phase {
+                    println!(
+                        "SESSION_PHASE_CHANGED from={:?} to={:?}",
+                        prev, current_phase
+                    );
+                }
+                last_phase = Some(current_phase);
+            }
 
-                if now < a_deadline.research_cutoff
-                    && self
-                        .store
-                        .checkpoint_value(&key)
-                        .map_err(|e| RuntimeError::Storage(e.to_string()))?
-                        .is_none()
-                {
-                    let staged_any = self
-                        .run_analysis_window_and_manufacture(symbols, now, &a_start)
-                        .await?;
-                    self.store
-                        .checkpoint(&key, if staged_any { "1" } else { "NO_CANDIDATE" })
-                        .map_err(|e| RuntimeError::Storage(e.to_string()))?;
-                } else if a_deadline.promotion_allowed(now) {
-                    let since = a_start.to_rfc3339();
-                    if let Some((version, _)) = self
-                        .store
-                        .latest_inactive_config_since(&since)
-                        .map_err(|e| RuntimeError::Storage(e.to_string()))?
-                    {
-                        let _ = self.activate_research_config(&version, now)?;
+            match current_phase {
+                SessionPhase::PreMarket => {
+                    if !pre_market_done {
+                        active_symbols = self
+                            .execute_pre_market(&session_id, &active_symbols, now)
+                            .await?;
+                        pre_market_done = true;
                     }
                 }
-            } else if self.active {
-                let clock = self
-                    .execution
-                    .clock()
-                    .await
-                    .map_err(|e| RuntimeError::Execution(e.to_string()))?;
+                SessionPhase::MarketOpen | SessionPhase::Trading => {
+                    if !open_done {
+                        if active_symbols.is_empty() {
+                            active_symbols = self.select_trading_universe(now).await?;
+                        }
+                        self.ensure_bots_manufactured(&active_symbols).await?;
+                        self.activate_market_open(&session_id).await?;
+                        open_done = true;
+                    }
 
-                if clock.is_open {
-                    for symbol in symbols {
-                        let now_tick = Utc::now();
-                        let end = now_tick
-                            - chrono::Duration::seconds(now_tick.timestamp().rem_euclid(60))
-                            - chrono::Duration::minutes(1);
-                        let start = end - chrono::Duration::minutes(6);
-                        match self.provider.bars(symbol, start, end).await {
-                            Ok(bs) => {
-                                for b in bs {
-                                    let event_id = format!(
-                                        "{}:{}",
-                                        symbol,
-                                        b.ts.timestamp_nanos_opt().unwrap_or(0)
-                                    );
-                                    self.on_market_bar_at(&event_id, b, end).await?;
+                    if self.active {
+                        let clock = self
+                            .execution
+                            .clock()
+                            .await
+                            .map_err(|e| RuntimeError::Execution(e.to_string()))?;
+
+                        if clock.is_open {
+                            for symbol in &active_symbols {
+                                let now_tick = Utc::now();
+                                let end = now_tick
+                                    - chrono::Duration::seconds(
+                                        now_tick.timestamp().rem_euclid(60),
+                                    )
+                                    - chrono::Duration::minutes(1);
+                                let start = end - chrono::Duration::minutes(6);
+                                match self.provider.bars(symbol, start, end).await {
+                                    Ok(bs) => {
+                                        for b in bs {
+                                            let event_id = format!(
+                                                "{}:{}",
+                                                symbol,
+                                                b.ts.timestamp_nanos_opt().unwrap_or(0)
+                                            );
+                                            self.on_market_bar_at(&event_id, b, end).await?;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        self.health = RuntimeHealth::Degraded;
+                                        let _ = self.store.event(
+                                            "MARKET_DATA_ERROR",
+                                            &serde_json::json!({"symbol": symbol, "error": e.to_string()}),
+                                        );
+                                    }
                                 }
                             }
-                            Err(e) => {
-                                self.health = RuntimeHealth::Degraded;
-                                self.store
-                                    .event(
-                                        "MARKET_DATA_ERROR",
-                                        &serde_json::json!({"symbol": symbol, "error": e.to_string()}),
-                                    )
-                                    .map_err(|x| RuntimeError::Storage(x.to_string()))?;
+
+                            println!(
+                                "BOT_EVALUATION phase={:?} active_bots={} open_trades={} trades_opened={} trades_closed={} realized_pnl={:.2}",
+                                current_phase,
+                                self.bot_plans.len(),
+                                self.open_trades.len(),
+                                self.stats.trades_opened,
+                                self.stats.trades_closed,
+                                self.stats.realized_pnl
+                            );
+                        } else {
+                            println!("MARKET_CLOSED is_open=false clock={:?}", clock);
+                        }
+
+                        if let Ok(h) = self.health_snapshot(Utc::now()).await {
+                            if !h.data_healthy && self.stats.last_market_event.is_some() {
+                                self.execution.risk_mut().engage_kill_switch();
+                                self.active = false;
+                                self.health = RuntimeHealth::Halted;
                             }
                         }
                     }
-
-                    println!(
-                        "BOT_EVALUATION phase={:?} active_bots={} open_trades={} trades_opened={} trades_closed={} realized_pnl={:.2}",
-                        current_phase,
-                        self.bot_plans.len(),
-                        self.open_trades.len(),
-                        self.stats.trades_opened,
-                        self.stats.trades_closed,
-                        self.stats.realized_pnl
-                    );
-                } else {
-                    println!("MARKET_CLOSED is_open=false clock={:?}", clock);
                 }
-
-                if let Ok(h) = self.health_snapshot(Utc::now()).await {
-                    if !h.data_healthy && self.stats.last_market_event.is_some() {
-                        self.execution.risk_mut().engage_kill_switch();
-                        self.active = false;
-                        self.health = RuntimeHealth::Halted;
+                SessionPhase::MarketClosing => {
+                    if !closing_done {
+                        self.execute_market_closing(&session_id).await?;
+                        closing_done = true;
+                    }
+                }
+                SessionPhase::PostMarket => {
+                    if !post_market_done {
+                        self.execute_post_market(&session_id, &active_symbols, now)
+                            .await?;
+                        post_market_done = true;
+                    }
+                }
+                SessionPhase::Learning => {
+                    if !learning_done {
+                        self.execute_learning(&session_id, &active_symbols, now)
+                            .await?;
+                        learning_done = true;
+                    }
+                }
+                SessionPhase::WaitingForNextSession | SessionPhase::Analysis => {
+                    self.active = false;
+                    if tick_count.is_multiple_of(12) {
+                        println!("HIVE_HEARTBEAT status=WAITING_FOR_NEXT_SESSION market_open=false active_bots=0");
                     }
                 }
             }

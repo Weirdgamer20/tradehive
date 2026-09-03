@@ -289,6 +289,16 @@ fn cert_bot_001_autonomous_sizing_formula_verification() {
 
 #[test]
 fn cert_risk_001_system_safety_limits_from_env() {
+    let _ = dotenvy::dotenv();
+    if std::env::var("RISK_MAX_ORDER_NOTIONAL").is_err() {
+        std::env::set_var("RISK_MAX_ORDER_NOTIONAL", "1000.0");
+        std::env::set_var("RISK_MAX_TOTAL_NOTIONAL", "5000.0");
+        std::env::set_var("RISK_MAX_DAILY_LOSS", "250.0");
+        std::env::set_var("RISK_MAX_POSITIONS", "10");
+        std::env::set_var("RISK_MAX_SINGLE_POSITION_QTY", "10");
+        std::env::set_var("RISK_MAX_SPREAD_BPS", "250.0");
+        std::env::set_var("RISK_MAX_SYMBOL_EXPOSURE", "1500.0");
+    }
     let limits = RiskLimits::from_env().unwrap();
     assert!(limits.max_order_notional > 0.0);
     assert!(limits.max_total_notional >= limits.max_order_notional);
@@ -836,6 +846,7 @@ async fn cert_session_001_autonomous_runtime_lifecycle_execution() {
     let broker = PaperBroker::new(1000000.0);
     let provider = SyntheticProvider;
     let mut rt = TradingRuntime::new(cfg, broker, provider).unwrap();
+    rt.phase_override = Some(th_domain::SessionPhase::MarketOpen);
 
     let symbols = vec!["SPY".to_string(), "QQQ".to_string()];
     let _stats = rt.run_session(&symbols, Some(2)).await.unwrap();

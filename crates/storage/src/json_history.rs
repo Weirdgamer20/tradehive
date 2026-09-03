@@ -243,6 +243,20 @@ impl JsonHistoryStore {
         let h: ReinforcementLearningHistory = read_or_default(&self.rl_path())?;
         Ok(h.rl_sessions.last().map(|s| s.seed_library_after.clone()))
     }
+
+    pub fn latest_rl_session(&self) -> Result<Option<RlSessionHistory>, JsonHistoryError> {
+        let h: ReinforcementLearningHistory = read_or_default(&self.rl_path())?;
+        Ok(h.rl_sessions.last().cloned())
+    }
+
+    pub fn record_session_dataset(&self, dataset: Value) -> Result<(), JsonHistoryError> {
+        let path = self.root.join("session_history.json");
+        with_lock(&path, || {
+            let mut list: Vec<Value> = read_or_default(&path)?;
+            list.push(dataset);
+            atomic_write(&path, &list)
+        })
+    }
 }
 
 impl BotHistoryRecord {

@@ -372,6 +372,12 @@ pub struct MarketState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionPhase {
+    PreMarket,
+    MarketOpen,
+    MarketClosing,
+    PostMarket,
+    Learning,
+    WaitingForNextSession,
     Trading,
     Analysis,
 }
@@ -382,6 +388,22 @@ impl SessionPhase {
         } else {
             Self::Analysis
         }
+    }
+
+    pub fn is_trading_active(&self) -> bool {
+        matches!(self, Self::MarketOpen | Self::Trading)
+    }
+
+    pub fn allows_new_entries(&self) -> bool {
+        matches!(self, Self::MarketOpen | Self::Trading)
+    }
+
+    pub fn is_market_closing(&self) -> bool {
+        matches!(self, Self::MarketClosing)
+    }
+
+    pub fn is_pre_market(&self) -> bool {
+        matches!(self, Self::PreMarket | Self::Analysis)
     }
 }
 

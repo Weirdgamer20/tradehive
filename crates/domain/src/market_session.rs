@@ -1,3 +1,4 @@
+use crate::SessionPhase;
 use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, Utc, Weekday};
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
@@ -279,6 +280,50 @@ impl MarketSessionClock {
 
     pub fn is_open(&self, dt: DateTime<Utc>) -> bool {
         self.session_state_at(dt).is_open()
+    }
+
+    pub fn phase_at(&self, dt: DateTime<Utc>) -> SessionPhase {
+        let local = dt.with_timezone(&self.config.timezone);
+        let weekday = local.weekday();
+
+        if weekday == Weekday::Sat || weekday == Weekday::Sun {
+            return SessionPhase::WaitingForNextSession;
+        }
+
+        let date = local.date_naive();
+        if HolidayCalendar::is_market_holiday(date).is_some() {
+            return SessionPhase::WaitingForNextSession;
+        }
+
+        let time = local.time();
+        let open_time = self.config.open_time;
+        let close_time = self.config.close_time;
+        let pre_market_start = open_time
+            .overflowing_sub_signed(chrono::Duration::minutes(60))
+            .0;
+        let closing_start = close_time
+            .overflowing_sub_signed(chrono::Duration::minutes(5))
+            .0;
+        let post_market_end = close_time
+            .overflowing_add_signed(chrono::Duration::minutes(30))
+            .0;
+        let learning_end = close_time
+            .overflowing_add_signed(chrono::Duration::minutes(90))
+            .0;
+
+        if time >= pre_market_start && time < open_time {
+            SessionPhase::PreMarket
+        } else if time >= open_time && time < closing_start {
+            SessionPhase::MarketOpen
+        } else if time >= closing_start && time < close_time {
+            SessionPhase::MarketClosing
+        } else if time >= close_time && time < post_market_end {
+            SessionPhase::PostMarket
+        } else if time >= post_market_end && time < learning_end {
+            SessionPhase::Learning
+        } else {
+            SessionPhase::WaitingForNextSession
+        }
     }
 
     pub fn timezone(&self) -> Tz {

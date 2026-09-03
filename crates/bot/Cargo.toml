@@ -26,3 +26,6 @@ th-operations={path="../operations"}
 th-research={path="../research"}
 th-deployment={path="../deployment"}
 th-reconcile={path="../reconcile"}
+
+[dev-dependencies]
+async-trait.workspace=true
