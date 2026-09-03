@@ -348,11 +348,12 @@ impl MarketSessionClock {
     pub fn next_market_open(&self, dt: DateTime<Utc>) -> DateTime<Utc> {
         let local = dt.with_timezone(&self.config.timezone);
         let current_date = local.date_naive();
-        let target_date = if local.time() < self.config.open_time && self.is_trading_day(current_date) {
-            current_date
-        } else {
-            self.next_trading_date(current_date)
-        };
+        let target_date =
+            if local.time() < self.config.open_time && self.is_trading_day(current_date) {
+                current_date
+            } else {
+                self.next_trading_date(current_date)
+            };
         let naive = target_date.and_time(self.config.open_time);
         naive
             .and_local_timezone(self.config.timezone)
@@ -364,11 +365,12 @@ impl MarketSessionClock {
     pub fn next_market_close(&self, dt: DateTime<Utc>) -> DateTime<Utc> {
         let local = dt.with_timezone(&self.config.timezone);
         let current_date = local.date_naive();
-        let target_date = if local.time() < self.config.close_time && self.is_trading_day(current_date) {
-            current_date
-        } else {
-            self.next_trading_date(current_date)
-        };
+        let target_date =
+            if local.time() < self.config.close_time && self.is_trading_day(current_date) {
+                current_date
+            } else {
+                self.next_trading_date(current_date)
+            };
         let naive = target_date.and_time(self.config.close_time);
         naive
             .and_local_timezone(self.config.timezone)

@@ -5,6 +5,7 @@ edition.workspace=true
 [dependencies]
 chrono.workspace=true
 chrono-tz.workspace=true
+rand.workspace=true
 serde.workspace=true
 serde_json.workspace=true
 thiserror.workspace=true
@@ -34,3 +35,6 @@ async-trait.workspace=true
 th-market-data={path="../market-data", features=["test-utils"]}
 th-options-data={path="../options-data"}
 th-backtest={path="../backtest"}
+
+[target.'cfg(unix)'.dependencies]
+sd-notify.workspace=true

@@ -36,6 +36,12 @@ pub trait Broker: Send + Sync {
         client_order_id: Uuid,
     ) -> Result<Option<BrokerOrder>, ExecutionError>;
     async fn cancel(&self, broker_order_id: &str) -> Result<(), ExecutionError>;
+    /// Returns all working (non-terminal) orders known to the broker.
+    async fn list_open_orders(&self) -> Result<Vec<BrokerOrder>, ExecutionError>;
+    /// Attempts to cancel all working orders. Returns the broker_order_ids of
+    /// orders that were successfully cancelled. Partial success is accepted;
+    /// callers must verify with `list_open_orders` afterward.
+    async fn cancel_all_orders(&self) -> Result<Vec<String>, ExecutionError>;
     async fn positions(&self) -> Result<Vec<Position>, ExecutionError>;
     async fn account(&self) -> Result<AccountSnapshot, ExecutionError>;
     async fn clock(&self) -> Result<MarketClock, ExecutionError>;
@@ -301,6 +307,39 @@ impl Broker for PaperBroker {
             cash: s.cash,
             buying_power: s.cash.max(0.0),
         })
+    }
+    async fn list_open_orders(&self) -> Result<Vec<BrokerOrder>, ExecutionError> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| ExecutionError::Broker("paper mutex poisoned".into()))?
+            .orders
+            .values()
+            .filter(|o| {
+                matches!(
+                    o.status,
+                    OrderStatus::New | OrderStatus::Accepted | OrderStatus::PartiallyFilled
+                )
+            })
+            .cloned()
+            .collect())
+    }
+    async fn cancel_all_orders(&self) -> Result<Vec<String>, ExecutionError> {
+        let mut s = self
+            .inner
+            .lock()
+            .map_err(|_| ExecutionError::Broker("paper mutex poisoned".into()))?;
+        let mut cancelled = Vec::new();
+        for order in s.orders.values_mut() {
+            if matches!(
+                order.status,
+                OrderStatus::New | OrderStatus::Accepted | OrderStatus::PartiallyFilled
+            ) {
+                order.status = OrderStatus::Cancelled;
+                cancelled.push(order.broker_order_id.clone());
+            }
+        }
+        Ok(cancelled)
     }
 }
 
@@ -624,6 +663,77 @@ impl Broker for AlpacaBroker {
             cash: parse("cash"),
             buying_power: parse("buying_power"),
         })
+    }
+    async fn list_open_orders(&self) -> Result<Vec<BrokerOrder>, ExecutionError> {
+        let url = format!(
+            "{}/v2/orders?status=open&limit=500",
+            self.base_url.trim_end_matches('/')
+        );
+        let r = self
+            .headers(self.client.get(url))
+            .send()
+            .await
+            .map_err(|e| ExecutionError::Broker(e.to_string()))?;
+        if !r.status().is_success() {
+            return Err(ExecutionError::Broker(format!(
+                "list_open_orders HTTP {}: {}",
+                r.status(),
+                r.text().await.unwrap_or_default()
+            )));
+        }
+        let xs: Vec<AlpacaOrderResp> = r
+            .json()
+            .await
+            .map_err(|e| ExecutionError::Broker(e.to_string()))?;
+        xs.into_iter()
+            .map(|x| {
+                Ok(BrokerOrder {
+                    broker_order_id: x.id,
+                    client_order_id: Uuid::parse_str(&x.client_order_id)
+                        .map_err(|e| ExecutionError::Broker(e.to_string()))?,
+                    status: parse_status(&x.status),
+                    filled_qty: x
+                        .filled_qty
+                        .parse()
+                        .map_err(|_| ExecutionError::Broker("invalid filled_qty".into()))?,
+                    filled_avg_price: x.filled_avg_price.and_then(|v| v.parse().ok()),
+                })
+            })
+            .collect()
+    }
+    async fn cancel_all_orders(&self) -> Result<Vec<String>, ExecutionError> {
+        // Alpaca DELETE /v2/orders returns 207 Multi-Status with per-order results.
+        let url = format!("{}/v2/orders", self.base_url.trim_end_matches('/'));
+        let r = self
+            .headers(self.client.delete(url))
+            .send()
+            .await
+            .map_err(|e| ExecutionError::Broker(e.to_string()))?;
+        // 207 is the success code for multi-status cancel. 422 = no open orders (success).
+        if r.status() == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+            return Ok(vec![]);
+        }
+        if !r.status().is_success() && r.status().as_u16() != 207 {
+            return Err(ExecutionError::Broker(format!(
+                "cancel_all_orders HTTP {}: {}",
+                r.status(),
+                r.text().await.unwrap_or_default()
+            )));
+        }
+        // Parse 207 multi-status body: [{"id": "...", "status": 200}]
+        let body: Vec<serde_json::Value> = r.json().await.unwrap_or_default();
+        Ok(body
+            .into_iter()
+            .filter_map(|v| {
+                let id = v.get("id")?.as_str()?.to_string();
+                let status = v.get("status")?.as_u64().unwrap_or(0);
+                if status == 200 {
+                    Some(id)
+                } else {
+                    None
+                }
+            })
+            .collect())
     }
 }
 

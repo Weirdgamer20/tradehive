@@ -48,9 +48,7 @@ impl MarketDataProvider for FailingProvider {
     ) -> Result<Vec<Bar>, MarketDataError> {
         // Return enough bars so that if most_actives somehow succeeded the
         // bars path would not itself be the failure point.
-        SyntheticProvider
-            .bars(symbol, _start, _end)
-            .await
+        SyntheticProvider.bars(symbol, _start, _end).await
     }
     async fn option_chain(
         &self,
@@ -101,7 +99,11 @@ fn create_test_runtime_failing() -> (TradingRuntime<PaperBroker, FailingProvider
     (runtime, db)
 }
 
-fn create_test_runtime_with_broker() -> (TradingRuntime<PaperBroker, SyntheticProvider>, PaperBroker, String) {
+fn create_test_runtime_with_broker() -> (
+    TradingRuntime<PaperBroker, SyntheticProvider>,
+    PaperBroker,
+    String,
+) {
     set_test_env();
     let db = format!("target/test_supervisor_{}.sqlite", Uuid::new_v4());
     let _ = std::fs::remove_file(&db);
@@ -162,7 +164,9 @@ async fn test_supervisor_checkpoint_roundtrip_persistence() {
 
     supervisor.persist_checkpoint();
 
-    let loaded = supervisor.load_checkpoint().expect("checkpoint should load from SQLite");
+    let loaded = supervisor
+        .load_checkpoint()
+        .expect("checkpoint should load from SQLite");
     assert_eq!(loaded.session_id, "SESSION-20260904");
     assert_eq!(loaded.supervisor_state, SupervisorState::Trading);
     assert_eq!(loaded.retry_count, 3);
@@ -180,7 +184,10 @@ async fn test_supervisor_state_transitions() {
 
     supervisor.transition_to(SupervisorState::WaitingForSession, "test_market_closed");
     assert_eq!(supervisor.state, SupervisorState::WaitingForSession);
-    assert_eq!(supervisor.checkpoint.supervisor_state, SupervisorState::WaitingForSession);
+    assert_eq!(
+        supervisor.checkpoint.supervisor_state,
+        SupervisorState::WaitingForSession
+    );
 
     supervisor.transition_to(SupervisorState::PreparingSession, "test_pre_open");
     assert_eq!(supervisor.state, SupervisorState::PreparingSession);
@@ -237,7 +244,10 @@ async fn test_supervisor_halt_state_preservation() {
 
     // Supervisor must remain in Halted state and not blindly restart trading
     assert_eq!(restarted.state, SupervisorState::Halted);
-    assert_eq!(restarted.halt_reason, Some("RECONCILIATION_MISMATCH".into()));
+    assert_eq!(
+        restarted.halt_reason,
+        Some("RECONCILIATION_MISMATCH".into())
+    );
 
     let _ = std::fs::remove_file(&db);
 }
@@ -252,23 +262,60 @@ async fn test_supervisor_exponential_backoff_calculation() {
     };
     let mut supervisor = HiveSupervisor::new(&mut runtime, config);
 
+    // With +/-20% jitter:
+    // retry 0: base 2000ms -> [1600ms, 2400ms]
     supervisor.retry_count = 0;
-    assert_eq!(supervisor.calculate_backoff_delay(), Duration::from_secs(2));
+    let d0 = supervisor.calculate_backoff_delay();
+    assert!(
+        d0 >= Duration::from_millis(1600) && d0 <= Duration::from_millis(2400),
+        "d0={:?}",
+        d0
+    );
 
+    // retry 1: base 4000ms -> [3200ms, 4800ms]
     supervisor.retry_count = 1;
-    assert_eq!(supervisor.calculate_backoff_delay(), Duration::from_secs(4));
+    let d1 = supervisor.calculate_backoff_delay();
+    assert!(
+        d1 >= Duration::from_millis(3200) && d1 <= Duration::from_millis(4800),
+        "d1={:?}",
+        d1
+    );
 
+    // retry 2: base 8000ms -> [6400ms, 9600ms]
     supervisor.retry_count = 2;
-    assert_eq!(supervisor.calculate_backoff_delay(), Duration::from_secs(8));
+    let d2 = supervisor.calculate_backoff_delay();
+    assert!(
+        d2 >= Duration::from_millis(6400) && d2 <= Duration::from_millis(9600),
+        "d2={:?}",
+        d2
+    );
 
+    // retry 3: base 16000ms -> [12800ms, 19200ms]
     supervisor.retry_count = 3;
-    assert_eq!(supervisor.calculate_backoff_delay(), Duration::from_secs(16));
+    let d3 = supervisor.calculate_backoff_delay();
+    assert!(
+        d3 >= Duration::from_millis(12800) && d3 <= Duration::from_millis(19200),
+        "d3={:?}",
+        d3
+    );
 
+    // retry 4: base 32000ms -> [25600ms, 38400ms]
     supervisor.retry_count = 4;
-    assert_eq!(supervisor.calculate_backoff_delay(), Duration::from_secs(32));
+    let d4 = supervisor.calculate_backoff_delay();
+    assert!(
+        d4 >= Duration::from_millis(25600) && d4 <= Duration::from_millis(38400),
+        "d4={:?}",
+        d4
+    );
 
+    // retry 5: base 60000ms (capped at max 60s) -> [48000ms, 60000ms]
     supervisor.retry_count = 5;
-    assert_eq!(supervisor.calculate_backoff_delay(), Duration::from_secs(60)); // capped at max_delay
+    let d5 = supervisor.calculate_backoff_delay();
+    assert!(
+        d5 >= Duration::from_millis(48000) && d5 <= Duration::from_millis(60000),
+        "d5={:?}",
+        d5
+    );
 
     let _ = std::fs::remove_file(&db);
 }
@@ -292,7 +339,10 @@ async fn test_supervisor_calendar_next_trading_date_and_holidays() {
     // Next trading date skips weekend and holiday
     let day_before_thanksgiving = NaiveDate::from_ymd_opt(2026, 11, 25).unwrap();
     let next_after_thanksgiving = clock.next_trading_date(day_before_thanksgiving);
-    assert_eq!(next_after_thanksgiving, NaiveDate::from_ymd_opt(2026, 11, 27).unwrap());
+    assert_eq!(
+        next_after_thanksgiving,
+        NaiveDate::from_ymd_opt(2026, 11, 27).unwrap()
+    );
 }
 
 #[tokio::test]
@@ -357,7 +407,11 @@ async fn test_supervisor_session_bot_retirement() {
     supervisor.initialize_and_recover().await.unwrap();
     let session_id = "SESSION-TEST-RETIRE";
     supervisor.runtime.current_session_id = Some(session_id.into());
-    let _ = supervisor.runtime.ensure_bots_manufactured(&["SPY".into()]).await.unwrap();
+    let _ = supervisor
+        .runtime
+        .ensure_bots_manufactured(&["SPY".into()])
+        .await
+        .unwrap();
     assert!(!supervisor.runtime.bot_plans.is_empty());
 
     supervisor.state = SupervisorState::Learning;
@@ -411,7 +465,11 @@ async fn test_supervisor_transient_broker_failure_and_recovery() {
 
     // Since PaperBroker is responsive, recovery succeeds and retry_count resets
     assert_eq!(supervisor.retry_count, 0);
-    assert!(supervisor.state == SupervisorState::WaitingForSession || supervisor.state == SupervisorState::PreparingSession || supervisor.state == SupervisorState::Trading);
+    assert!(
+        supervisor.state == SupervisorState::WaitingForSession
+            || supervisor.state == SupervisorState::PreparingSession
+            || supervisor.state == SupervisorState::Trading
+    );
 
     let _ = std::fs::remove_file(&db);
 }
@@ -429,7 +487,11 @@ async fn test_supervisor_kill_switch_safety_halt() {
     supervisor.runtime.stats.last_market_event = Some(Utc::now() - chrono::Duration::hours(2));
     supervisor.runtime.cfg.max_quote_age_secs = 10;
 
-    let _ = supervisor.runtime.ensure_bots_manufactured(&["SPY".into()]).await.unwrap();
+    let _ = supervisor
+        .runtime
+        .ensure_bots_manufactured(&["SPY".into()])
+        .await
+        .unwrap();
     supervisor.state = SupervisorState::Trading;
 
     let mut tick_count = 0;
@@ -458,7 +520,10 @@ async fn test_supervisor_checkpoint_sqlite_durability_across_reopen() {
 
     // Reopen directly from raw SQLite Store
     let raw_store = th_storage::Store::open(&db).unwrap();
-    let checkpoint_str = raw_store.get_checkpoint("SUPERVISOR_CHECKPOINT").unwrap().expect("checkpoint must exist in db");
+    let checkpoint_str = raw_store
+        .get_checkpoint("SUPERVISOR_CHECKPOINT")
+        .unwrap()
+        .expect("checkpoint must exist in db");
     let cp: th_bot::SupervisorCheckpoint = serde_json::from_str(&checkpoint_str).unwrap();
 
     assert_eq!(cp.session_id, "SESSION-DURABILITY-99");
@@ -482,7 +547,10 @@ async fn test_supervisor_weekend_and_holiday_waiting() {
     let christmas = NaiveDate::from_ymd_opt(2026, 12, 25).unwrap();
     assert!(!clock.is_trading_day(christmas));
     let next_after_xmas = clock.next_trading_date(christmas);
-    assert_eq!(next_after_xmas, NaiveDate::from_ymd_opt(2026, 12, 28).unwrap());
+    assert_eq!(
+        next_after_xmas,
+        NaiveDate::from_ymd_opt(2026, 12, 28).unwrap()
+    );
 }
 
 #[tokio::test]
@@ -576,7 +644,11 @@ async fn test_supervisor_automatic_universe_and_session_binding() {
     let session_id = "SESSION-UNIVERSE-BIND-01";
     supervisor.runtime.current_session_id = Some(session_id.into());
 
-    let count = supervisor.runtime.ensure_bots_manufactured(&["SPY".into()]).await.unwrap();
+    let count = supervisor
+        .runtime
+        .ensure_bots_manufactured(&["SPY".into()])
+        .await
+        .unwrap();
     assert!(count > 0);
 
     for plan in supervisor.runtime.bot_plans.values() {
@@ -585,7 +657,6 @@ async fn test_supervisor_automatic_universe_and_session_binding() {
 
     let _ = std::fs::remove_file(&db);
 }
-
 
 // ---------------------------------------------------------------------------
 // New tests: stall detection and finalization fail-closed behaviour
@@ -611,8 +682,7 @@ async fn test_supervisor_stall_detection_withholds_watchdog_and_recovers() {
     supervisor.runtime.active = true;
 
     // Backdate last_progress far beyond 4 x 1 ms.
-    supervisor.last_progress = std::time::Instant::now()
-        - Duration::from_secs(600);
+    supervisor.last_progress = std::time::Instant::now() - Duration::from_secs(600);
 
     let retry_before = supervisor.retry_count;
     supervisor.emit_heartbeat(Utc::now());
@@ -678,6 +748,358 @@ async fn test_supervisor_finalization_failure_transitions_to_recovering() {
     assert!(
         supervisor.retry_count > 0,
         "retry_count must be incremented on finalization failure"
+    );
+
+    let _ = std::fs::remove_file(&db);
+}
+
+#[derive(Clone)]
+struct FailingBroker;
+
+#[async_trait::async_trait]
+impl th_execution::Broker for FailingBroker {
+    async fn submit(
+        &self,
+        _order: &th_domain::OrderIntent,
+    ) -> Result<th_execution::BrokerOrder, th_execution::ExecutionError> {
+        Err(th_execution::ExecutionError::Broker(
+            "forced_broker_failure".into(),
+        ))
+    }
+    async fn get_order(
+        &self,
+        _broker_order_id: &str,
+    ) -> Result<th_execution::BrokerOrder, th_execution::ExecutionError> {
+        Err(th_execution::ExecutionError::Broker(
+            "forced_broker_failure".into(),
+        ))
+    }
+    async fn find_by_client_order_id(
+        &self,
+        _cid: Uuid,
+    ) -> Result<Option<th_execution::BrokerOrder>, th_execution::ExecutionError> {
+        Err(th_execution::ExecutionError::Broker(
+            "forced_broker_failure".into(),
+        ))
+    }
+    async fn cancel(&self, _broker_order_id: &str) -> Result<(), th_execution::ExecutionError> {
+        Err(th_execution::ExecutionError::Broker(
+            "forced_broker_failure".into(),
+        ))
+    }
+    async fn list_open_orders(
+        &self,
+    ) -> Result<Vec<th_execution::BrokerOrder>, th_execution::ExecutionError> {
+        Err(th_execution::ExecutionError::Broker(
+            "forced_broker_failure".into(),
+        ))
+    }
+    async fn cancel_all_orders(&self) -> Result<Vec<String>, th_execution::ExecutionError> {
+        Err(th_execution::ExecutionError::Broker(
+            "forced_broker_failure".into(),
+        ))
+    }
+    async fn positions(&self) -> Result<Vec<th_domain::Position>, th_execution::ExecutionError> {
+        Err(th_execution::ExecutionError::Broker(
+            "forced_broker_failure".into(),
+        ))
+    }
+    async fn account(&self) -> Result<th_execution::AccountSnapshot, th_execution::ExecutionError> {
+        Err(th_execution::ExecutionError::Broker(
+            "forced_broker_failure".into(),
+        ))
+    }
+    async fn clock(&self) -> Result<th_execution::MarketClock, th_execution::ExecutionError> {
+        Err(th_execution::ExecutionError::Broker(
+            "forced_broker_failure".into(),
+        ))
+    }
+}
+
+fn create_test_runtime_with_failing_broker(
+) -> (TradingRuntime<FailingBroker, SyntheticProvider>, String) {
+    set_test_env();
+    let db = format!("target/test_supervisor_{}.sqlite", Uuid::new_v4());
+    let _ = std::fs::remove_file(&db);
+    let hist_dir = format!("target/test_hist_supervisor_{}", Uuid::new_v4());
+    let _ = std::fs::remove_dir_all(&hist_dir);
+    std::fs::create_dir_all(&hist_dir).unwrap();
+    std::env::set_var("TRADING_HIVE_HISTORY_DIR", &hist_dir);
+
+    let broker = FailingBroker;
+    let provider = SyntheticProvider;
+
+    let runtime = TradingRuntime::new(
+        RuntimeConfig {
+            database_path: db.clone(),
+            candidate_universe: vec!["SPY".into()],
+            ..RuntimeConfig::testing()
+        },
+        broker,
+        provider,
+    )
+    .unwrap();
+
+    (runtime, db)
+}
+
+#[tokio::test]
+async fn test_recovery_false_reconciliation_stays_in_recovering() {
+    let (mut runtime, db) = create_test_runtime();
+    let config = SupervisorConfig::default();
+
+    // Insert an open trade that has no counterpart on the broker (0 positions).
+    runtime.open_trades.insert(
+        "SPY-mismatch".into(),
+        th_bot::OpenTrade {
+            symbol: "SPY230915C00450000".into(),
+            underlying: "SPY".into(),
+            strategy_id: "test_strategy".into(),
+            entry_price: 5.0,
+            entry_ts: Utc::now(),
+            stop_loss_pct: 0.05,
+            take_profit_pct: 0.10,
+            qty: 1,
+        },
+    );
+
+    let mut supervisor = HiveSupervisor::new(&mut runtime, config);
+    supervisor.state = SupervisorState::Recovering;
+
+    let mut tick_count = 0usize;
+    supervisor.step(None, &mut tick_count).await.unwrap();
+
+    assert_eq!(
+        supervisor.state,
+        SupervisorState::Recovering,
+        "false reconciliation must keep supervisor in Recovering state"
+    );
+    assert_eq!(supervisor.retry_count, 1);
+    assert!(
+        supervisor
+            .checkpoint
+            .last_error
+            .as_deref()
+            .unwrap_or("")
+            .starts_with("reconciliation_mismatch"),
+        "last_error should record reconciliation mismatch"
+    );
+    assert!(!supervisor.runtime.active, "runtime must remain inactive");
+
+    let _ = std::fs::remove_file(&db);
+}
+
+#[tokio::test]
+async fn test_recovery_error_reconciliation_stays_in_recovering() {
+    let (mut runtime, db) = create_test_runtime_with_failing_broker();
+    let config = SupervisorConfig::default();
+
+    let mut supervisor = HiveSupervisor::new(&mut runtime, config);
+    supervisor.state = SupervisorState::Recovering;
+
+    let mut tick_count = 0usize;
+    supervisor.step(None, &mut tick_count).await.unwrap();
+
+    assert_eq!(
+        supervisor.state,
+        SupervisorState::Recovering,
+        "error reconciliation must keep supervisor in Recovering state"
+    );
+    assert_eq!(supervisor.retry_count, 1);
+    assert!(
+        supervisor
+            .checkpoint
+            .last_error
+            .as_deref()
+            .unwrap_or("")
+            .starts_with("broker_unreachable")
+            || supervisor
+                .checkpoint
+                .last_error
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("reconciliation_error"),
+        "last_error must record broker unreachable or reconciliation error"
+    );
+    assert!(!supervisor.runtime.active, "runtime must remain inactive");
+
+    let _ = std::fs::remove_file(&db);
+}
+
+#[tokio::test]
+async fn test_retry_budget_exhausted_enters_halted() {
+    let (mut runtime, db) = create_test_runtime();
+    let config = SupervisorConfig {
+        max_retries: 3,
+        initial_retry_delay: Duration::from_millis(1),
+        max_retry_delay: Duration::from_millis(5),
+        ..SupervisorConfig::default()
+    };
+
+    // Mismatched position so recovery always fails.
+    runtime.open_trades.insert(
+        "SPY-mismatch".into(),
+        th_bot::OpenTrade {
+            symbol: "SPY230915C00450000".into(),
+            underlying: "SPY".into(),
+            strategy_id: "test_strategy".into(),
+            entry_price: 5.0,
+            entry_ts: Utc::now(),
+            stop_loss_pct: 0.05,
+            take_profit_pct: 0.10,
+            qty: 1,
+        },
+    );
+
+    let mut supervisor = HiveSupervisor::new(&mut runtime, config);
+    supervisor.state = SupervisorState::Recovering;
+
+    let mut tick_count = 0usize;
+    // Step until max_retries is reached
+    for _ in 0..3 {
+        supervisor.step(None, &mut tick_count).await.unwrap();
+    }
+
+    assert_eq!(
+        supervisor.state,
+        SupervisorState::Halted,
+        "exhausting retry budget must transition to Halted"
+    );
+    assert!(supervisor
+        .checkpoint
+        .last_error
+        .as_deref()
+        .unwrap_or("")
+        .starts_with("retry_budget_exhausted"));
+
+    let _ = std::fs::remove_file(&db);
+}
+
+#[tokio::test]
+async fn test_preparing_session_reconcile_failure_does_not_clear_state() {
+    let (mut runtime, db) = create_test_runtime();
+    let config = SupervisorConfig::default();
+
+    // Add a dummy bot plan
+    runtime.bot_plans.insert(
+        "bot-1".into(),
+        th_deployment::BotCreationPlan {
+            session_id: "sess-1".into(),
+            plan_id: "plan-1".into(),
+            bot_id: "bot-1".into(),
+            strategy_id: "momentum".into(),
+            strategy_version: 1,
+            config_version: "v1".into(),
+            underlying: "SPY".into(),
+            option_symbol: "SPY230915C00450000".into(),
+            option_type: th_domain::OptionType::Call,
+            strike: 450.0,
+            expiry: Utc::now(),
+            capital_allocated: 10_000.0,
+            risk_budget: 200.0,
+            min_expiry_minutes: 0,
+            max_expiry_minutes: 100,
+            created_at: Utc::now(),
+            fingerprint: "fp".into(),
+            quantity: 1,
+            entry_limit: 5.0,
+            stop_loss_pct: 0.05,
+            take_profit_pct: 0.10,
+            generation_id: "gen-1".into(),
+            risk_pct: 0.02,
+            max_capital_exposure: 10_000.0,
+            rl_state: None,
+            rl_action: None,
+            rl_confidence: 1.0,
+        },
+    );
+
+    // Mismatched position so reconciliation fails in PreparingSession
+    runtime.open_trades.insert(
+        "SPY-mismatch".into(),
+        th_bot::OpenTrade {
+            symbol: "SPY230915C00450000".into(),
+            underlying: "SPY".into(),
+            strategy_id: "test_strategy".into(),
+            entry_price: 5.0,
+            entry_ts: Utc::now(),
+            stop_loss_pct: 0.05,
+            take_profit_pct: 0.10,
+            qty: 1,
+        },
+    );
+
+    let mut supervisor = HiveSupervisor::new(&mut runtime, config);
+    supervisor.state = SupervisorState::PreparingSession;
+
+    let mut tick_count = 0usize;
+    supervisor.step(None, &mut tick_count).await.unwrap();
+
+    assert_eq!(
+        supervisor.state,
+        SupervisorState::Recovering,
+        "reconcile failure in PreparingSession must transition to Recovering"
+    );
+    assert_eq!(
+        supervisor.runtime.bot_plans.len(),
+        1,
+        "bot_plans must NOT be cleared when reconciliation fails before mutation"
+    );
+
+    let _ = std::fs::remove_file(&db);
+}
+
+#[tokio::test]
+async fn test_ready_not_sent_when_degraded() {
+    let (mut runtime, db) = create_test_runtime_with_failing_broker();
+    let config = SupervisorConfig::default();
+
+    let mut supervisor = HiveSupervisor::new(&mut runtime, config);
+    // Initialize and recover with failing broker
+    let _ = supervisor.initialize_and_recover().await;
+
+    assert_eq!(
+        supervisor.state,
+        SupervisorState::Degraded,
+        "startup with broker failure must enter Degraded"
+    );
+    assert_ne!(
+        supervisor.state,
+        SupervisorState::WaitingForSession,
+        "startup with broker failure must not enter WaitingForSession"
+    );
+
+    let _ = std::fs::remove_file(&db);
+}
+
+#[tokio::test]
+async fn test_backoff_jitter_non_deterministic() {
+    let (mut runtime, db) = create_test_runtime();
+    let config = SupervisorConfig {
+        initial_retry_delay: Duration::from_secs(2),
+        max_retry_delay: Duration::from_secs(60),
+        ..SupervisorConfig::default()
+    };
+    let mut supervisor = HiveSupervisor::new(&mut runtime, config);
+    supervisor.retry_count = 2; // base = 8000ms, range = [6400ms, 9600ms]
+
+    let mut samples = Vec::new();
+    for _ in 0..30 {
+        let d = supervisor.calculate_backoff_delay();
+        assert!(
+            d >= Duration::from_millis(6400) && d <= Duration::from_millis(9600),
+            "delay {:?} must be in bounds [6400ms, 9600ms]",
+            d
+        );
+        samples.push(d.as_millis());
+    }
+
+    // Verify there are distinct values among the 30 samples (proving non-determinism/jitter)
+    let first = samples[0];
+    let has_variation = samples.iter().any(|&s| s != first);
+    assert!(
+        has_variation,
+        "backoff delays must vary across calls due to jitter"
     );
 
     let _ = std::fs::remove_file(&db);

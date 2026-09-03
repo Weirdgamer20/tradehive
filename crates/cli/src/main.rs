@@ -113,8 +113,11 @@ async fn run_autonomous(max_ticks: Option<usize>) -> Result<(), Box<dyn std::err
 
     let mut runtime = TradingRuntime::new(cfg, broker, provider)?;
 
-    let mut supervisor = th_bot::HiveSupervisor::new(&mut runtime, th_bot::SupervisorConfig::default());
-    supervisor.initialize_and_recover().await
+    let mut supervisor =
+        th_bot::HiveSupervisor::new(&mut runtime, th_bot::SupervisorConfig::default());
+    supervisor
+        .initialize_and_recover()
+        .await
         .map_err(|e| format!("SUPERVISOR_INIT_FAILED: {e}"))?;
 
     tokio::select! {
