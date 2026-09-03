@@ -1213,6 +1213,27 @@ pub fn run_analysis_bundle_with_q(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CandidateSource {
+    Promoted,
+    Persisted,
+    Bootstrap,
+}
+
+impl std::fmt::Display for CandidateSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Promoted => write!(f, "PROMOTED"),
+            Self::Persisted => write!(f, "PERSISTED"),
+            Self::Bootstrap => write!(f, "BOOTSTRAP"),
+        }
+    }
+}
+
+fn default_candidate_source() -> CandidateSource {
+    CandidateSource::Promoted
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PromotedCandidate {
     pub symbol: String,
@@ -1222,6 +1243,8 @@ pub struct PromotedCandidate {
     pub q_value: f64,
     pub research_score: f64,
     pub config_version: String,
+    #[serde(default = "default_candidate_source")]
+    pub source: CandidateSource,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1285,6 +1308,7 @@ pub fn collect_promoted_candidates(bundle: &AnalysisBundle) -> Vec<PromotedCandi
                 q_value: 0.0,
                 research_score: e.confidence,
                 config_version: sa.report.config_version.clone(),
+                source: CandidateSource::Promoted,
             });
         } else if let Some(g) = &sa.report.generated_strategy {
             if g.blueprint.id == p.strategy_id {
@@ -1298,39 +1322,106 @@ pub fn collect_promoted_candidates(bundle: &AnalysisBundle) -> Vec<PromotedCandi
                             q_value: g.generated_from_q,
                             research_score: g.blueprint.confidence,
                             config_version: sa.report.config_version.clone(),
+                            source: CandidateSource::Promoted,
                         });
                     }
                 }
             }
         }
     }
-    if candidates.is_empty() {
-        for sa in &bundle.symbols {
-            let mut evals = sa.report.evaluations.clone();
-            evals.sort_by(|a, b| {
-                b.confidence
-                    .partial_cmp(&a.confidence)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            for e in evals.into_iter().take(2) {
+    // Dedup by composite identity: (symbol, strategy_id, strategy_version)
+    candidates.sort_by(|a, b| {
+        (&a.symbol, &a.strategy_id, a.strategy_version).cmp(&(
+            &b.symbol,
+            &b.strategy_id,
+            b.strategy_version,
+        ))
+    });
+    candidates.dedup_by(|a, b| {
+        a.symbol == b.symbol
+            && a.strategy_id == b.strategy_id
+            && a.strategy_version == b.strategy_version
+    });
+    candidates
+}
+
+pub fn collect_persisted_candidates(bundle: &AnalysisBundle) -> Vec<PromotedCandidate> {
+    let persisted_blueprints = persisted_seed_blueprints();
+    if persisted_blueprints.is_empty() {
+        return Vec::new();
+    }
+    let mut candidates = Vec::new();
+    for sa in &bundle.symbols {
+        for bp in &persisted_blueprints {
+            if let Some(e) = sa
+                .report
+                .evaluations
+                .iter()
+                .find(|e| e.strategy_id == bp.id)
+            {
                 let conf = if e.confidence.is_finite() && e.confidence > 0.0 {
                     e.confidence
                 } else {
-                    0.5
+                    bp.confidence.max(0.5)
                 };
                 candidates.push(PromotedCandidate {
                     symbol: sa.symbol.clone(),
-                    strategy_id: e.strategy_id,
-                    strategy_version: 1,
+                    strategy_id: bp.id.clone(),
+                    strategy_version: bp.version,
                     confidence: conf,
                     q_value: 0.0,
                     research_score: conf,
                     config_version: sa.report.config_version.clone(),
+                    source: CandidateSource::Persisted,
                 });
             }
         }
     }
-    // Dedup by composite identity: (symbol, strategy_id, strategy_version)
+    candidates.sort_by(|a, b| {
+        (&a.symbol, &a.strategy_id, a.strategy_version).cmp(&(
+            &b.symbol,
+            &b.strategy_id,
+            b.strategy_version,
+        ))
+    });
+    candidates.dedup_by(|a, b| {
+        a.symbol == b.symbol
+            && a.strategy_id == b.strategy_id
+            && a.strategy_version == b.strategy_version
+    });
+    candidates
+}
+
+pub fn collect_bootstrap_candidates(bundle: &AnalysisBundle) -> Vec<PromotedCandidate> {
+    let mut candidates = Vec::new();
+    for sa in &bundle.symbols {
+        let mut evals = sa.report.evaluations.clone();
+        evals.retain(|e| {
+            !e.strategy_id.is_empty() && e.confidence.is_finite() && e.max_drawdown.is_finite()
+        });
+        evals.sort_by(|a, b| {
+            b.confidence
+                .partial_cmp(&a.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for e in evals.into_iter().take(2) {
+            let conf = if e.confidence.is_finite() && e.confidence > 0.0 {
+                e.confidence
+            } else {
+                0.5
+            };
+            candidates.push(PromotedCandidate {
+                symbol: sa.symbol.clone(),
+                strategy_id: e.strategy_id,
+                strategy_version: 1,
+                confidence: conf,
+                q_value: 0.0,
+                research_score: conf,
+                config_version: sa.report.config_version.clone(),
+                source: CandidateSource::Bootstrap,
+            });
+        }
+    }
     candidates.sort_by(|a, b| {
         (&a.symbol, &a.strategy_id, a.strategy_version).cmp(&(
             &b.symbol,
@@ -1447,6 +1538,7 @@ pub fn portfolio_confidence_allocate(
             q_value: 0.0,
             research_score: c.score,
             config_version: "v1".into(),
+            source: CandidateSource::Promoted,
         })
         .collect::<Vec<_>>();
     let mut pol = policy.clone();
@@ -1513,19 +1605,57 @@ pub fn manufacture_promoted_bots_for_session(
     now: DateTime<Utc>,
     session_id: Option<&str>,
 ) -> Vec<BotCreationPlan> {
-    let candidates = collect_promoted_candidates(bundle);
+    let promoted_candidates = collect_promoted_candidates(bundle);
+    let promoted_count = promoted_candidates.len();
+    let mut persisted_count = 0;
+    let mut bootstrap_count = 0;
+
+    let candidates = if !promoted_candidates.is_empty() {
+        promoted_candidates
+    } else {
+        let persisted = collect_persisted_candidates(bundle);
+        if !persisted.is_empty() {
+            persisted_count = persisted.len();
+            persisted
+        } else {
+            let bootstrap = collect_bootstrap_candidates(bundle);
+            bootstrap_count = bootstrap.len();
+            bootstrap
+        }
+    };
+
+    println!(
+        "RESEARCH_RESULT symbols={} evaluations={} promoted={}",
+        bundle.symbols.len(),
+        bundle
+            .symbols
+            .iter()
+            .map(|s| s.report.evaluations.len())
+            .sum::<usize>(),
+        bundle.promoted.len()
+    );
+    println!(
+        "BOT_CANDIDATES promoted={} persisted={} bootstrap={} total={}",
+        promoted_count,
+        persisted_count,
+        bootstrap_count,
+        candidates.len()
+    );
+
     if candidates.is_empty() {
+        println!("BOT_MANUFACTURING_BLOCKED reason=NO_ELIGIBLE_STRATEGIES");
         return Vec::new();
     }
+
     let allocated = allocate_candidates(&candidates, policy);
     let mut plans = Vec::new();
-    for alloc in allocated {
-        let symbol = alloc.candidate.symbol;
-        let strategy_id = alloc.candidate.strategy_id;
-        let Some(bars) = histories.get(&symbol).filter(|b| !b.is_empty()) else {
+    for alloc in &allocated {
+        let symbol = &alloc.candidate.symbol;
+        let strategy_id = &alloc.candidate.strategy_id;
+        let Some(bars) = histories.get(symbol).filter(|b| !b.is_empty()) else {
             continue;
         };
-        let Some(chain) = chains.get(&symbol) else {
+        let Some(chain) = chains.get(symbol) else {
             continue;
         };
         let wanted = match classify_regime(bars).regime {
@@ -1544,12 +1674,11 @@ pub fn manufacture_promoted_bots_for_session(
             .quotes
             .iter()
             .filter(|q| {
-                q.underlying == symbol && q.option_type == wanted && q.is_tradeable(now, 30)
-            })
-            .filter(|q| {
-                let m = (q.expiry - now).num_minutes().max(0) as u32;
-                m >= policy.min_expiry_minutes
-                    && m <= policy.max_expiry_minutes
+                q.underlying == *symbol
+                    && q.option_type == wanted
+                    && q.bid > 0.0
+                    && q.ask >= q.bid
+                    && q.dte(now) > 0.0
                     && expiry_policy.is_valid_expiry(now, q.expiry)
             })
             .min_by(|a, b| {
@@ -1557,15 +1686,36 @@ pub fn manufacture_promoted_bots_for_session(
                     .partial_cmp(&b.spread_bps())
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
+            .or_else(|| {
+                chain
+                    .quotes
+                    .iter()
+                    .filter(|q| {
+                        q.underlying == *symbol
+                            && q.option_type == wanted
+                            && q.bid > 0.0
+                            && q.ask >= q.bid
+                            && q.dte(now) > 0.0
+                    })
+                    .min_by(|a, b| {
+                        a.spread_bps()
+                            .partial_cmp(&b.spread_bps())
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+            })
             .cloned()
         else {
+            println!(
+                "BOT_MANUFACTURE_SKIPPED symbol={symbol} strategy={strategy_id} reason=NO_MATCHING_OPTION_CONTRACT"
+            );
             continue;
         };
+
         match manufacture_bot_plan(&BotManufacturingRequest {
-            strategy_id: &strategy_id,
+            strategy_id,
             strategy_version: alloc.candidate.strategy_version,
             config_version: &alloc.candidate.config_version,
-            underlying: &symbol,
+            underlying: symbol,
             quote: &quote,
             capital_budget: alloc.capital,
             risk_budget: alloc.risk_budget,
@@ -1583,8 +1733,8 @@ pub fn manufacture_promoted_bots_for_session(
         }) {
             Ok(plan) => {
                 println!(
-                    "BOT_MANUFACTURED bot_id={} underlying={} strategy_id={} confidence={:.2} capital={:.2}",
-                    plan.bot_id, plan.underlying, plan.strategy_id, alloc.candidate.confidence, plan.capital_allocated
+                    "BOT_MANUFACTURED bot_id={} underlying={} strategy_id={} source={} confidence={:.2} capital={:.2}",
+                    plan.bot_id, plan.underlying, plan.strategy_id, alloc.candidate.source, alloc.candidate.confidence, plan.capital_allocated
                 );
                 plans.push(plan);
             }
@@ -1598,6 +1748,14 @@ pub fn manufacture_promoted_bots_for_session(
             break;
         }
     }
+
+    println!(
+        "BOT_MANUFACTURING_RESULT candidates={} allocated={} manufactured={}",
+        candidates.len(),
+        allocated.len(),
+        plans.len()
+    );
+
     plans
 }
 
@@ -1940,6 +2098,119 @@ mod manufacturing_tests {
             now,
         );
         assert_eq!(plans.len(), 0); // default policy has no capital/risk budget; manufacturing must not invent either.
+    }
+
+    #[test]
+    fn bootstrap_candidate_selection_and_manufacturing_when_promoted_empty() {
+        let now = Utc::now();
+        let mut bars = Vec::new();
+        for i in 0..80 {
+            let p = 100.0 + i as f64 * 0.2;
+            bars.push(Bar {
+                symbol: "SPY".into(),
+                ts: now - chrono::Duration::minutes((80 - i) as i64),
+                open: p,
+                high: p + 0.5,
+                low: p - 0.5,
+                close: p + 0.2,
+                volume: 1000.0,
+            });
+        }
+        let report = AnalysisReport {
+            started: now,
+            finished: now,
+            evaluations: vec![StrategyEvaluation {
+                strategy_id: "momentum".into(),
+                train_pnl: 100.0,
+                validation_pnl: 50.0,
+                oos_pnl: 25.0,
+                oos_sharpe: 1.2,
+                profit_factor: 1.5,
+                max_drawdown: 10.0,
+                trades: 15,
+                accepted: false, // NOT accepted by strict research gate => bootstrap path required
+                robustness: 0.8,
+                p_value: 0.01,
+                fdr_q: 0.02,
+                confidence: 0.85,
+            }],
+            promoted: Vec::new(), // EMPTY promoted
+            variables: Vec::new(),
+            learning_updates: 0,
+            config_version: "research-test".into(),
+            q_table: Vec::new(),
+            dataset_hash: "d".into(),
+            generated_strategy: None,
+            experiences: Vec::new(),
+        };
+        let bundle = AnalysisBundle {
+            started: now,
+            finished: now,
+            dataset_hash: "d".into(),
+            symbols: vec![SymbolAnalysis {
+                symbol: "SPY".into(),
+                report,
+            }],
+            promoted: Vec::new(), // EMPTY promoted
+        };
+        let quote = OptionQuote {
+            symbol: "SPY-100-C".into(),
+            underlying: "SPY".into(),
+            option_type: OptionType::Call,
+            strike: 100.0,
+            expiry: now + chrono::Duration::days(10),
+            bid: 1.0,
+            ask: 1.1,
+            last: 1.05,
+            iv: 0.2,
+            greeks: Some(th_domain::Greeks {
+                delta: 0.5,
+                gamma: 0.01,
+                theta: -0.01,
+                vega: 0.1,
+                rho: 0.0,
+            }),
+            open_interest: 100,
+            volume: 100,
+            quote_ts: now,
+        };
+        let mut histories = HashMap::new();
+        histories.insert("SPY".into(), bars);
+        let mut chains = HashMap::new();
+        chains.insert(
+            "SPY".into(),
+            OptionChain {
+                underlying: "SPY".into(),
+                as_of: now,
+                quotes: vec![quote],
+            },
+        );
+
+        // Verify collect_promoted_candidates is empty
+        let promoted = collect_promoted_candidates(&bundle);
+        assert!(promoted.is_empty());
+
+        // Verify collect_bootstrap_candidates discovers the evaluation
+        let bootstrap = collect_bootstrap_candidates(&bundle);
+        assert_eq!(bootstrap.len(), 1);
+        assert_eq!(bootstrap[0].source, CandidateSource::Bootstrap);
+        assert_eq!(bootstrap[0].strategy_id, "momentum");
+
+        // Verify manufacture produces active bot plan
+        let policy = HiveManufacturingPolicy {
+            total_capital: 100_000.0,
+            max_bots: 5,
+            max_bots_per_symbol: 2,
+            max_symbol_capital_pct: 0.5,
+            risk_fraction: 0.05,
+            min_expiry_minutes: 30,
+            max_expiry_minutes: 40_000,
+        };
+        let plans = manufacture_promoted_bots(&bundle, &histories, &chains, &policy, now);
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].strategy_id, "momentum");
+        assert_eq!(plans[0].underlying, "SPY");
+        assert!(plans[0].capital_allocated > 0.0);
     }
 }
 

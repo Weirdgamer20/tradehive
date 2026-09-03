@@ -1674,7 +1674,11 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
         // Stage 2: Fetch bars for each candidate and rank by volume.
         println!("UNIVERSE_SELECTION_STARTED candidates={:?}", candidates);
         let mut liquid_symbols: Vec<(String, f64)> = Vec::new();
+        let target_pool = (universe_size * 2).clamp(15, 30);
         for sym in &candidates {
+            if liquid_symbols.len() >= target_pool {
+                break;
+            }
             let end = now;
             let start = end - chrono::Duration::days(5);
             match self.provider.bars(sym, start, end).await {
@@ -1832,6 +1836,12 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
             mfg_now,
             self.current_session_id.as_deref(),
         );
+        if plans.is_empty() {
+            println!("BOT_MANUFACTURING_BLOCKED reason=NO_BOT_PLANS_MANUFACTURED");
+            return Err(RuntimeError::Market(
+                "BOT_MANUFACTURING_BLOCKED: failed to manufacture any active bots".into(),
+            ));
+        }
         for plan in &plans {
             self.store
                 .save_bot_plan(plan)

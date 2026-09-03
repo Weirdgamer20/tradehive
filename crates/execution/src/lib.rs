@@ -688,7 +688,7 @@ impl<B: Broker> ExecutionEngine<B> {
         portfolio: &PortfolioRisk,
     ) -> Result<(BrokerOrder, RiskApproval), ExecutionError> {
         let broker_clock = self.broker.clock().await?;
-        if !broker_clock.is_open {
+        if !broker_clock.is_open && !o.reduce_only {
             return Err(ExecutionError::MarketClosed("MARKET_CLOSED".into()));
         }
         let o = make_order(o)?;
