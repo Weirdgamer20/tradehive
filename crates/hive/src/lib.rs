@@ -614,6 +614,63 @@ pub struct AnalysisReport {
     pub generated_strategy: Option<GeneratedStrategyRecord>,
     pub experiences: Vec<Experience>,
 }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EconomicRewardDecomposition {
+    pub alpha_reward: f64,
+    pub execution_reward: f64,
+    pub risk_reward: f64,
+    pub portfolio_reward: f64,
+    pub composite_reward: f64,
+}
+
+pub fn compute_economic_rl_reward(
+    pnl: f64,
+    capital_allocated: f64,
+    slippage_bps: f64,
+    spread_bps: f64,
+    fees: f64,
+    bars_held: usize,
+) -> EconomicRewardDecomposition {
+    let capital = capital_allocated.max(100.0);
+    let net_return = pnl / capital;
+
+    // 1. Alpha reward: gross return before execution friction
+    let friction = (slippage_bps + spread_bps) / 10_000.0 + fees / capital;
+    let alpha_reward = (net_return + friction).clamp(-0.20, 0.20);
+
+    // 2. Execution reward: penalized for slippage/spread costs
+    let execution_reward = (-friction * 2.0).clamp(-0.10, 0.0);
+
+    // 3. Risk / Duration reward: penalty for holding through severe theta decay
+    let duration_penalty = if bars_held > 12 {
+        (bars_held - 12) as f64 * 0.002
+    } else {
+        0.0
+    };
+    let risk_reward = (-duration_penalty).clamp(-0.05, 0.0);
+
+    // 4. Portfolio reward: scaled real financial outcome
+    let portfolio_reward = if net_return > 0.0 {
+        (net_return * 0.5).clamp(0.0, 0.10)
+    } else {
+        (net_return * 0.8).clamp(-0.15, 0.0)
+    };
+
+    let composite_reward = (alpha_reward * 0.40
+        + execution_reward * 0.25
+        + risk_reward * 0.15
+        + portfolio_reward * 0.20)
+        .clamp(-0.10, 0.10);
+
+    EconomicRewardDecomposition {
+        alpha_reward,
+        execution_reward,
+        risk_reward,
+        portfolio_reward,
+        composite_reward,
+    }
+}
+
 pub fn learn_from_trades(
     mut q: QLearning,
     histories: &HashMap<String, Vec<Bar>>,
@@ -641,7 +698,15 @@ pub fn learn_from_trades(
             &bars[..=bars.iter().position(|b| b.ts == entry_bar.ts).unwrap_or(0)],
         ));
         let next_state = state.clone();
-        let reward = (t.pnl / 100.0).clamp(-0.05, 0.05);
+        let reward = compute_economic_rl_reward(
+            t.pnl,
+            t.entry_fill_price.unwrap_or(1.0) * 100.0,
+            t.slippage_bps.unwrap_or(2.0),
+            t.quote_spread_bps.unwrap_or(5.0),
+            1.5,
+            12,
+        )
+        .composite_reward;
         q.update(&Experience {
             state,
             action: t.strategy_id.clone(),
@@ -774,15 +839,19 @@ pub fn run_analysis_with_q(bars: &[Bar], prior: Option<QLearning>) -> AnalysisRe
                         continue;
                     }
                     let r = bars[i + 1].close / bars[i].close - 1.0;
-                    let reward = match sig.side {
-                        SignalSide::LongCall => r,
-                        SignalSide::LongPut => -r,
+                    // Realistic option delta (0.50), friction (15 bps), and theta decay (-5 bps/bar)
+                    let delta = 0.50;
+                    let friction_and_theta = 0.0020;
+                    let option_return = match sig.side {
+                        SignalSide::LongCall => r * delta - friction_and_theta,
+                        SignalSide::LongPut => -r * delta - friction_and_theta,
                         SignalSide::Flat => 0.0,
                     };
+                    let reward = option_return.clamp(-0.10, 0.10);
                     let exp = Experience {
                         state: state.clone(),
                         action: actions[idx].clone(),
-                        reward: reward.clamp(-0.05, 0.05),
+                        reward,
                         next_state: next.clone(),
                         terminal: i + 1 == bars.len() - 1,
                         decision_ts: bars[i].ts,

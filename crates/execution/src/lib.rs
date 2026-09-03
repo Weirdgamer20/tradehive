@@ -62,6 +62,27 @@ pub struct MarketClock {
     pub next_close: Option<chrono::DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaperExecutionConfig {
+    pub slippage_bps: f64,
+    pub spread_bps: f64,
+    pub partial_fill_pct: Option<f64>,
+    pub reject_probability: f64,
+    pub simulate_latency_ms: u64,
+}
+
+impl Default for PaperExecutionConfig {
+    fn default() -> Self {
+        Self {
+            slippage_bps: 2.0,
+            spread_bps: 10.0,
+            partial_fill_pct: None,
+            reject_probability: 0.0,
+            simulate_latency_ms: 0,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct PaperBroker {
     inner: Arc<Mutex<PaperState>>,
@@ -72,12 +93,18 @@ struct PaperState {
     positions: HashMap<String, Position>,
     cash: f64,
     mock_clock_open: Option<bool>,
+    config: PaperExecutionConfig,
 }
 impl PaperBroker {
     pub fn new(cash: f64) -> Self {
+        Self::with_config(cash, PaperExecutionConfig::default())
+    }
+
+    pub fn with_config(cash: f64, config: PaperExecutionConfig) -> Self {
         Self {
             inner: Arc::new(Mutex::new(PaperState {
                 cash,
+                config,
                 ..Default::default()
             })),
         }
@@ -105,14 +132,24 @@ impl Broker for PaperBroker {
         if let Some(existing) = s.orders.get(&o.client_order_id) {
             return Err(ExecutionError::Duplicate(existing.client_order_id));
         }
-        let px = o
+
+        let base_px = o
             .limit_price
             .ok_or_else(|| ExecutionError::Invalid("paper broker requires limit price".into()))?;
-        if !px.is_finite() || px <= 0.0 {
+        if !base_px.is_finite() || base_px <= 0.0 {
             return Err(ExecutionError::Invalid(
                 "invalid paper execution price".into(),
             ));
         }
+
+        // Apply realistic slippage & spread crossing
+        let slip_bps = s.config.slippage_bps;
+        let spread_bps = s.config.spread_bps;
+        let px = match o.side {
+            OrderSide::Buy => base_px * (1.0 + (slip_bps + spread_bps / 2.0) / 10_000.0),
+            OrderSide::Sell => base_px * (1.0 - (slip_bps + spread_bps / 2.0) / 10_000.0),
+        };
+
         let existing_qty = s.positions.get(&o.symbol).map(|p| p.qty).unwrap_or(0);
         if o.reduce_only && o.side != OrderSide::Sell {
             return Err(ExecutionError::Invalid(
@@ -129,7 +166,21 @@ impl Broker for PaperBroker {
                 "naked option sells are disabled".into(),
             ));
         }
-        let cash_delta = px * o.qty as f64 * CONTRACT_MULTIPLIER;
+
+        // Calculate fill quantity (handling realistic partial fills)
+        let fill_qty = if let Some(pct) = s.config.partial_fill_pct {
+            ((o.qty as f64 * pct).floor() as u32).clamp(1, o.qty)
+        } else {
+            o.qty
+        };
+
+        let status = if fill_qty < o.qty {
+            OrderStatus::PartiallyFilled
+        } else {
+            OrderStatus::Filled
+        };
+
+        let cash_delta = px * fill_qty as f64 * CONTRACT_MULTIPLIER;
         if o.side == OrderSide::Buy && s.cash < cash_delta {
             return Err(ExecutionError::Broker("insufficient cash".into()));
         }
@@ -142,8 +193,8 @@ impl Broker for PaperBroker {
         let bo = BrokerOrder {
             broker_order_id: Uuid::new_v4().to_string(),
             client_order_id: o.client_order_id,
-            status: OrderStatus::Filled,
-            filled_qty: o.qty,
+            status,
+            filled_qty: fill_qty,
             filled_avg_price: Some(px),
         };
         if o.side == OrderSide::Buy {

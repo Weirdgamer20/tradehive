@@ -709,6 +709,10 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                     strategy_id: t.strategy_id.clone(),
                     created_at: Utc::now(),
                     order_hash: String::new(),
+                    bot_id: Some(t.strategy_id.clone()),
+                    session_id: self.current_session_id.clone(),
+                    decision_id: None,
+                    oms_state: Some(th_domain::OmsState::IntentCreated),
                 };
                 order.order_hash = order_hash(&order);
                 let spread = q.spread_bps();
@@ -1170,6 +1174,13 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
             strategy_id: sig.strategy_id.clone(),
             created_at: Utc::now(),
             order_hash: String::new(),
+            bot_id: sig.bot_id.clone(),
+            session_id: sig
+                .session_id
+                .clone()
+                .or_else(|| self.current_session_id.clone()),
+            decision_id: Some(sig.id),
+            oms_state: Some(th_domain::OmsState::IntentCreated),
         };
         order.order_hash = order_hash(&order);
         if let Some((broker_id, status)) = self
@@ -2113,6 +2124,10 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                 strategy_id: t.strategy_id.clone(),
                 created_at: Utc::now(),
                 order_hash: String::new(),
+                bot_id: Some(t.strategy_id.clone()),
+                session_id: self.current_session_id.clone(),
+                decision_id: None,
+                oms_state: Some(th_domain::OmsState::IntentCreated),
             };
             order.order_hash = order_hash(&order);
 

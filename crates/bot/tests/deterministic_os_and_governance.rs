@@ -56,7 +56,10 @@ fn test_independent_and_adversarial_evaluator() {
     let evaluator = IndependentEvaluator::default();
     let bars = vec![];
     let opinions = vec![];
-    let res = evaluator.evaluate("CAND-01", "SPY", "STRAT-01", 1, &bars, &opinions);
+    let mut strat = th_strategy::MovingAverageCrossover::default();
+    let res = evaluator.evaluate(
+        "CAND-01", "SPY", "STRAT-01", 1, &mut strat, &bars, &opinions, 1,
+    );
     assert!(
         !res.promoted,
         "Empty/insufficient candidate must not be promoted"
@@ -76,9 +79,13 @@ fn test_independent_and_adversarial_evaluator() {
         spread_penalty: 0.001,
         liquidity_penalty: 0.0005,
         net_utility: 0.015,
+        psr: 0.95,
+        dsr: 0.85,
+        pbo: 0.15,
+        monte_carlo_p_value: 0.01,
     };
 
-    let adv = AdversarialEvaluator::test_candidate(&[], &metrics, &[]);
+    let adv = AdversarialEvaluator::test_candidate(&[], &metrics, &[], &[]);
     assert!(
         adv.overall_approved,
         "Valid metrics should clear adversarial evaluation"
@@ -108,7 +115,7 @@ fn test_portfolio_meta_controller_and_experience_store() {
         quantity: 0,
         entry_limit: 0.0,
         stop_loss_pct: 0.05,
-        take_profit_pct: 0.10,
+        take_profit_pct: 0.0,
         generation_id: "GEN-01".into(),
         risk_pct: 0.02,
         max_capital_exposure: 10000.0,
@@ -127,6 +134,9 @@ fn test_portfolio_meta_controller_and_experience_store() {
         reason: "Momentum".into(),
         generated_at: Utc::now(),
         config_version: "v1".into(),
+        session_id: None,
+        bot_id: None,
+        candidate_id: None,
     };
 
     let allocations =

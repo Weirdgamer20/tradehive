@@ -279,6 +279,12 @@ pub struct Signal {
     pub reason: String,
     pub generated_at: DateTime<Utc>,
     pub config_version: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub bot_id: Option<String>,
+    #[serde(default)]
+    pub candidate_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -286,6 +292,7 @@ pub enum OrderSide {
     Buy,
     Sell,
 }
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OrderStatus {
     New,
@@ -295,6 +302,60 @@ pub enum OrderStatus {
     Cancelled,
     Rejected,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OmsState {
+    IntentCreated,
+    RiskReserved,
+    Submitting,
+    Submitted,
+    Accepted,
+    PartiallyFilled,
+    Filled,
+    CancelRequested,
+    Cancelled,
+    Rejected,
+    Expired,
+    Failed,
+    Unknown,
+    Reconciling,
+    Reconciled,
+}
+
+impl OmsState {
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::Filled
+                | Self::Cancelled
+                | Self::Rejected
+                | Self::Expired
+                | Self::Failed
+                | Self::Reconciled
+        )
+    }
+
+    pub fn is_ambiguous(&self) -> bool {
+        matches!(self, Self::Unknown | Self::Reconciling)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProvenanceChain {
+    pub research_run_id: String,
+    pub candidate_id: String,
+    pub strategy_id: String,
+    pub strategy_version: u32,
+    pub bot_id: String,
+    pub session_id: String,
+    pub decision_id: Uuid,
+    pub client_order_id: Uuid,
+    pub broker_order_id: Option<String>,
+    pub fill_id: Option<Uuid>,
+    pub trade_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderIntent {
     pub client_order_id: Uuid,
@@ -306,6 +367,14 @@ pub struct OrderIntent {
     pub strategy_id: String,
     pub created_at: DateTime<Utc>,
     pub order_hash: String,
+    #[serde(default)]
+    pub bot_id: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub decision_id: Option<Uuid>,
+    #[serde(default)]
+    pub oms_state: Option<OmsState>,
 }
 impl OrderIntent {
     pub fn validate(&self) -> Result<(), DomainError> {

@@ -1252,6 +1252,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "th-backtest",
  "th-deployment",
  "th-domain",
  "th-execution",
@@ -1260,6 +1261,7 @@ dependencies = [
  "th-market-data",
  "th-memory",
  "th-operations",
+ "th-options-data",
  "th-reconcile",
  "th-research",
  "th-risk",
@@ -1383,6 +1385,7 @@ version = "0.9.0"
 dependencies = [
  "chrono",
  "serde",
+ "sha2",
  "th-domain",
  "thiserror",
 ]
@@ -1407,6 +1410,7 @@ dependencies = [
  "th-domain",
  "th-hive",
  "th-intelligence",
+ "th-strategy",
  "thiserror",
 ]
 

@@ -251,6 +251,9 @@ fn signal(
         reason: reason.into(),
         generated_at: Utc::now(),
         config_version: "production-v1".into(),
+        session_id: None,
+        bot_id: None,
+        candidate_id: None,
     }
 }
 

@@ -846,6 +846,10 @@ mod tests {
             strategy_id: "momentum".into(),
             created_at: Utc::now(),
             order_hash: "h".into(),
+            bot_id: None,
+            session_id: None,
+            decision_id: None,
+            oms_state: None,
         };
         assert!(s.reserve_order(&o).unwrap());
         assert!(!s.reserve_order(&o).unwrap());

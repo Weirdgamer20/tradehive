@@ -3,6 +3,25 @@ use th_domain::{Bar, OptionType, SignalSide};
 use th_strategy::{classify_regime, Strategy};
 use thiserror::Error;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExecutionModel {
+    Naive,
+    Realistic,
+}
+
+fn default_execution_model() -> ExecutionModel {
+    ExecutionModel::Realistic
+}
+fn default_spread_bps() -> f64 {
+    20.0
+}
+fn default_participation_limit() -> f64 {
+    0.10
+}
+fn default_latency_bars() -> usize {
+    1
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BacktestConfig {
     pub initial_cash: f64,
@@ -10,7 +29,16 @@ pub struct BacktestConfig {
     pub slippage_bps: f64,
     pub multiplier: f64,
     pub max_hold_bars: usize,
+    #[serde(default = "default_execution_model")]
+    pub execution_model: ExecutionModel,
+    #[serde(default = "default_spread_bps")]
+    pub spread_bps: f64,
+    #[serde(default = "default_participation_limit")]
+    pub max_volume_participation_pct: f64,
+    #[serde(default = "default_latency_bars")]
+    pub latency_bars: usize,
 }
+
 impl Default for BacktestConfig {
     fn default() -> Self {
         Self {
@@ -19,9 +47,14 @@ impl Default for BacktestConfig {
             slippage_bps: 2.0,
             multiplier: 100.0,
             max_hold_bars: 12,
+            execution_model: ExecutionModel::Realistic,
+            spread_bps: 20.0,
+            max_volume_participation_pct: 0.10,
+            latency_bars: 1,
         }
     }
 }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TradeResult {
     pub entry_ts: i64,
@@ -30,7 +63,16 @@ pub struct TradeResult {
     pub entry: f64,
     pub exit: f64,
     pub pnl: f64,
+    #[serde(default)]
+    pub slippage_incurred: f64,
+    #[serde(default)]
+    pub spread_cost: f64,
+    #[serde(default)]
+    pub fees_paid: f64,
+    #[serde(default)]
+    pub bars_held: usize,
 }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BacktestReport {
     pub strategy_id: String,
@@ -42,7 +84,10 @@ pub struct BacktestReport {
     pub profit_factor: f64,
     pub max_drawdown: f64,
     pub sharpe: f64,
+    pub turnover: f64,
+    pub execution_model: ExecutionModel,
 }
+
 #[derive(Debug, Error)]
 pub enum BacktestError {
     #[error("insufficient data")]
@@ -50,9 +95,7 @@ pub enum BacktestError {
     #[error("invalid split")]
     InvalidSplit,
 }
-fn cost(entry: f64, exit: f64, cfg: &BacktestConfig) -> f64 {
-    (entry + exit) * cfg.multiplier * (cfg.fee_bps + cfg.slippage_bps) / 10_000.0
-}
+
 fn stats(trades: &[TradeResult], initial: f64) -> (f64, f64, f64, f64) {
     let wins = trades.iter().filter(|t| t.pnl > 0.0).count();
     let gains = trades
@@ -98,24 +141,25 @@ fn stats(trades: &[TradeResult], initial: f64) -> (f64, f64, f64, f64) {
         },
         if losses > 0.0 {
             gains / losses
+        } else if gains > 0.0 {
+            f64::INFINITY
         } else {
-            if gains > 0.0 {
-                f64::INFINITY
-            } else {
-                0.0
-            }
+            0.0
         },
         dd,
         sharpe,
     )
 }
+
 pub struct Backtester {
     cfg: BacktestConfig,
 }
+
 impl Backtester {
     pub fn new(cfg: BacktestConfig) -> Self {
         Self { cfg }
     }
+
     pub fn run(
         &self,
         strategy: &mut dyn Strategy,
@@ -133,90 +177,205 @@ impl Backtester {
             return Err(BacktestError::InsufficientData);
         }
         let mut trades = Vec::new();
-        let mut open: Option<(SignalSide, f64, i64, usize)> = None;
-        let mut pending: Option<SignalSide> = None;
+        let mut open: Option<(SignalSide, f64, i64, usize, f64, f64)> = None;
+        let mut pending: Option<(SignalSide, usize)> = None;
+
         for i in 0..bars.len() {
             let bar = &bars[i];
-            if let Some((old, entry, ets, ei)) = open.take() {
-                if i.saturating_sub(ei) >= self.cfg.max_hold_bars {
-                    let exit = bar.open;
+
+            // 1. Check max hold duration exit
+            if let Some((old, entry_px, ets, ei, entry_slip, entry_spread)) = open.take() {
+                let bars_held = i.saturating_sub(ei);
+                if bars_held >= self.cfg.max_hold_bars {
+                    let (exit_px, exit_slip, exit_spread) = match self.cfg.execution_model {
+                        ExecutionModel::Naive => (bar.open, 0.0, 0.0),
+                        ExecutionModel::Realistic => {
+                            let spread_cost = bar.open * (self.cfg.spread_bps / 2.0) / 10_000.0;
+                            let slip_cost = bar.open * self.cfg.slippage_bps / 10_000.0;
+                            match old {
+                                SignalSide::LongCall => {
+                                    (bar.open - spread_cost - slip_cost, slip_cost, spread_cost)
+                                }
+                                SignalSide::LongPut => {
+                                    (bar.open + spread_cost + slip_cost, slip_cost, spread_cost)
+                                }
+                                SignalSide::Flat => (bar.open, 0.0, 0.0),
+                            }
+                        }
+                    };
+
                     let raw = match old {
-                        SignalSide::LongCall => exit - entry,
-                        SignalSide::LongPut => entry - exit,
+                        SignalSide::LongCall => exit_px - entry_px,
+                        SignalSide::LongPut => entry_px - exit_px,
                         SignalSide::Flat => 0.0,
                     };
-                    let pnl = raw * self.cfg.multiplier - cost(entry, exit, &self.cfg);
+                    let fees =
+                        (entry_px + exit_px) * self.cfg.multiplier * (self.cfg.fee_bps / 10_000.0);
+                    let pnl = raw * self.cfg.multiplier - fees;
+
                     trades.push(TradeResult {
                         entry_ts: ets,
                         exit_ts: bar.ts.timestamp(),
                         side: old,
-                        entry,
-                        exit,
+                        entry: entry_px,
+                        exit: exit_px,
                         pnl,
+                        slippage_incurred: (entry_slip + exit_slip) * self.cfg.multiplier,
+                        spread_cost: (entry_spread + exit_spread) * self.cfg.multiplier,
+                        fees_paid: fees,
+                        bars_held,
                     });
                 } else {
-                    open = Some((old, entry, ets, ei));
+                    open = Some((old, entry_px, ets, ei, entry_slip, entry_spread));
                 }
             }
-            // A signal formed on bar i is executable no earlier than bar i+1. This prevents same-bar look-ahead.
-            if let Some(side) = pending.take() {
-                if i > 0 {
-                    if let Some((old, entry, ets, ei)) = open.take() {
+
+            // 2. Check pending signals (next-bar execution: formed at t, executed at earliest t + latency)
+            if let Some((side, signal_bar)) = pending {
+                if i >= signal_bar + self.cfg.latency_bars.max(1) {
+                    pending = None;
+                    if let Some((old, entry_px, ets, ei, entry_slip, entry_spread)) = open.take() {
                         if old != side {
-                            let exit = bar.open;
+                            let (exit_px, exit_slip, exit_spread) = match self.cfg.execution_model {
+                                ExecutionModel::Naive => (bar.open, 0.0, 0.0),
+                                ExecutionModel::Realistic => {
+                                    let spread_cost =
+                                        bar.open * (self.cfg.spread_bps / 2.0) / 10_000.0;
+                                    let slip_cost = bar.open * self.cfg.slippage_bps / 10_000.0;
+                                    match old {
+                                        SignalSide::LongCall => (
+                                            bar.open - spread_cost - slip_cost,
+                                            slip_cost,
+                                            spread_cost,
+                                        ),
+                                        SignalSide::LongPut => (
+                                            bar.open + spread_cost + slip_cost,
+                                            slip_cost,
+                                            spread_cost,
+                                        ),
+                                        SignalSide::Flat => (bar.open, 0.0, 0.0),
+                                    }
+                                }
+                            };
                             let raw = match old {
-                                SignalSide::LongCall => exit - entry,
-                                SignalSide::LongPut => entry - exit,
+                                SignalSide::LongCall => exit_px - entry_px,
+                                SignalSide::LongPut => entry_px - exit_px,
                                 SignalSide::Flat => 0.0,
                             };
-                            let pnl = raw * self.cfg.multiplier - cost(entry, exit, &self.cfg);
+                            let fees = (entry_px + exit_px)
+                                * self.cfg.multiplier
+                                * (self.cfg.fee_bps / 10_000.0);
+                            let pnl = raw * self.cfg.multiplier - fees;
                             trades.push(TradeResult {
                                 entry_ts: ets,
                                 exit_ts: bar.ts.timestamp(),
                                 side: old,
-                                entry,
-                                exit,
+                                entry: entry_px,
+                                exit: exit_px,
                                 pnl,
+                                slippage_incurred: (entry_slip + exit_slip) * self.cfg.multiplier,
+                                spread_cost: (entry_spread + exit_spread) * self.cfg.multiplier,
+                                fees_paid: fees,
+                                bars_held: i.saturating_sub(ei),
                             });
                         } else {
-                            open = Some((old, entry, ets, ei));
+                            open = Some((old, entry_px, ets, ei, entry_slip, entry_spread));
                         }
                     }
+
                     if open.is_none() && side != SignalSide::Flat {
-                        open = Some((side, bar.open, bar.ts.timestamp(), i));
+                        let (entry_px, entry_slip, entry_spread) = match self.cfg.execution_model {
+                            ExecutionModel::Naive => (bar.open, 0.0, 0.0),
+                            ExecutionModel::Realistic => {
+                                let spread_cost = bar.open * (self.cfg.spread_bps / 2.0) / 10_000.0;
+                                let slip_cost = bar.open * self.cfg.slippage_bps / 10_000.0;
+                                match side {
+                                    SignalSide::LongCall => {
+                                        (bar.open + spread_cost + slip_cost, slip_cost, spread_cost)
+                                    }
+                                    SignalSide::LongPut => {
+                                        (bar.open - spread_cost - slip_cost, slip_cost, spread_cost)
+                                    }
+                                    SignalSide::Flat => (bar.open, 0.0, 0.0),
+                                }
+                            }
+                        };
+                        open = Some((
+                            side,
+                            entry_px,
+                            bar.ts.timestamp(),
+                            i,
+                            entry_slip,
+                            entry_spread,
+                        ));
                     }
                 }
             }
+
             let state = classify_regime(&bars[..=i]);
             if let Some(sig) = strategy.update(bar, &state) {
                 if sig.side != SignalSide::Flat {
-                    pending = Some(sig.side)
+                    pending = Some((sig.side, i));
                 }
             }
         }
-        if let Some((side, entry, ets, _)) = open {
+
+        // Close final remaining open trade
+        if let Some((side, entry_px, ets, ei, entry_slip, entry_spread)) = open {
             let Some(b) = bars.last() else {
                 return Err(BacktestError::InsufficientData);
             };
-            let exit = b.close;
+            let (exit_px, exit_slip, exit_spread) = match self.cfg.execution_model {
+                ExecutionModel::Naive => (b.close, 0.0, 0.0),
+                ExecutionModel::Realistic => {
+                    let spread_cost = b.close * (self.cfg.spread_bps / 2.0) / 10_000.0;
+                    let slip_cost = b.close * self.cfg.slippage_bps / 10_000.0;
+                    match side {
+                        SignalSide::LongCall => {
+                            (b.close - spread_cost - slip_cost, slip_cost, spread_cost)
+                        }
+                        SignalSide::LongPut => {
+                            (b.close + spread_cost + slip_cost, slip_cost, spread_cost)
+                        }
+                        SignalSide::Flat => (b.close, 0.0, 0.0),
+                    }
+                }
+            };
             let raw = match side {
-                SignalSide::LongCall => exit - entry,
-                SignalSide::LongPut => entry - exit,
+                SignalSide::LongCall => exit_px - entry_px,
+                SignalSide::LongPut => entry_px - exit_px,
                 SignalSide::Flat => 0.0,
             };
-            let pnl = raw * self.cfg.multiplier - cost(entry, exit, &self.cfg);
+            let fees = (entry_px + exit_px) * self.cfg.multiplier * (self.cfg.fee_bps / 10_000.0);
+            let pnl = raw * self.cfg.multiplier - fees;
             trades.push(TradeResult {
                 entry_ts: ets,
                 exit_ts: b.ts.timestamp(),
                 side,
-                entry,
-                exit,
+                entry: entry_px,
+                exit: exit_px,
                 pnl,
+                slippage_incurred: (entry_slip + exit_slip) * self.cfg.multiplier,
+                spread_cost: (entry_spread + exit_spread) * self.cfg.multiplier,
+                fees_paid: fees,
+                bars_held: bars.len().saturating_sub(ei),
             });
         }
+
         let net = trades.iter().map(|t| t.pnl).sum::<f64>();
         let final_cash = self.cfg.initial_cash + net;
         let (win, pf, dd, sharpe) = stats(&trades, self.cfg.initial_cash);
+
+        let total_traded_value: f64 = trades
+            .iter()
+            .map(|t| (t.entry + t.exit) * self.cfg.multiplier)
+            .sum();
+        let turnover = if self.cfg.initial_cash > 0.0 {
+            total_traded_value / self.cfg.initial_cash
+        } else {
+            0.0
+        };
+
         Ok(BacktestReport {
             strategy_id: strategy.spec().id.clone(),
             initial_cash: self.cfg.initial_cash,
@@ -227,6 +386,8 @@ impl Backtester {
             profit_factor: pf,
             max_drawdown: dd,
             sharpe,
+            turnover,
+            execution_model: self.cfg.execution_model,
         })
     }
 }
