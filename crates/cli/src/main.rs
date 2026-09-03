@@ -93,6 +93,8 @@ async fn run_autonomous(max_ticks: Option<usize>) -> Result<(), Box<dyn std::err
     let broker = AlpacaBroker::new(trading_url, key, secret, is_live)?;
 
     use th_execution::Broker;
+    let mut startup_guard = th_bot::StartupWatchdogGuard::arm(std::time::Duration::from_secs(60));
+
     let acct = broker
         .account()
         .await
@@ -119,6 +121,8 @@ async fn run_autonomous(max_ticks: Option<usize>) -> Result<(), Box<dyn std::err
         .initialize_and_recover()
         .await
         .map_err(|e| format!("SUPERVISOR_INIT_FAILED: {e}"))?;
+
+    startup_guard.disarm();
 
     tokio::select! {
         res = supervisor.run_supervised(max_ticks) => {

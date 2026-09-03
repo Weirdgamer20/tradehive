@@ -32,6 +32,7 @@ th-sentinel={path="../sentinel"}
 
 [dev-dependencies]
 async-trait.workspace=true
+rusqlite.workspace=true
 th-market-data={path="../market-data", features=["test-utils"]}
 th-options-data={path="../options-data"}
 th-backtest={path="../backtest"}

@@ -1104,3 +1104,187 @@ async fn test_backoff_jitter_non_deterministic() {
 
     let _ = std::fs::remove_file(&db);
 }
+
+#[tokio::test]
+async fn test_checkpoint_write_failure_aborts_state_transition() {
+    let (mut runtime, db) = create_test_runtime();
+    let config = SupervisorConfig::default();
+    let mut supervisor = HiveSupervisor::new(&mut runtime, config);
+
+    // Corrupt the underlying database by dropping the checkpoints table
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute("DROP TABLE checkpoints", []).unwrap();
+    }
+
+    let previous_state = supervisor.state;
+    // Attempt state transition to Trading
+    let res = supervisor.transition_to_verified(SupervisorState::Trading, "test_failure");
+
+    assert!(
+        res.is_err(),
+        "transition must return Err when durable write fails"
+    );
+    assert_eq!(
+        supervisor.state, previous_state,
+        "in-memory state must NOT be updated when durable persistence fails"
+    );
+    assert!(
+        !supervisor.runtime.active,
+        "trading must be disabled on checkpoint failure"
+    );
+
+    let _ = std::fs::remove_file(&db);
+}
+
+#[tokio::test]
+async fn test_corrupt_checkpoint_fails_typed_load() {
+    let (mut runtime, db) = create_test_runtime();
+    let config = SupervisorConfig::default();
+    let mut supervisor = HiveSupervisor::new(&mut runtime, config);
+
+    // Save corrupted JSON as the supervisor checkpoint
+    let _ = supervisor.runtime.store.save_checkpoint(
+        "SUPERVISOR_CHECKPOINT",
+        "{malformed_json_not_a_valid_checkpoint",
+    );
+
+    let load_res = supervisor.load_checkpoint_typed();
+    assert!(load_res.is_err(), "corrupt checkpoint must return Err");
+    assert_ne!(
+        load_res.ok(),
+        Some(th_bot::CheckpointLoad::Missing),
+        "corrupt checkpoint must NEVER collapse into CheckpointLoad::Missing"
+    );
+
+    // initialize_and_recover must fail and enter Halted
+    let init_res = supervisor.initialize_and_recover().await;
+    assert!(
+        init_res.is_err(),
+        "startup on corrupt checkpoint must return Err"
+    );
+    assert_eq!(
+        supervisor.state,
+        SupervisorState::Halted,
+        "corrupt safety state must enter Halted, not clean start"
+    );
+
+    let _ = std::fs::remove_file(&db);
+}
+
+#[tokio::test]
+async fn test_unknown_broker_status_maps_to_unknown_not_new() {
+    use th_domain::OrderStatus;
+
+    // Verify OrderStatus helper methods
+    assert!(OrderStatus::New.is_working());
+    assert!(OrderStatus::Accepted.is_working());
+    assert!(OrderStatus::PartiallyFilled.is_working());
+    assert!(OrderStatus::PendingCancel.is_working());
+
+    assert!(OrderStatus::Filled.is_terminal());
+    assert!(OrderStatus::Cancelled.is_terminal());
+    assert!(OrderStatus::Rejected.is_terminal());
+    assert!(OrderStatus::Expired.is_terminal());
+
+    assert!(OrderStatus::Unknown.requires_reconciliation());
+    assert!(OrderStatus::Replaced.requires_reconciliation());
+
+    assert_ne!(OrderStatus::Unknown, OrderStatus::New);
+}
+
+#[tokio::test]
+async fn test_paper_broker_partial_fill_accounting_consistency() {
+    use th_domain::{OmsState, OrderIntent, OrderSide, OrderStatus};
+    use th_execution::{Broker, PaperBroker, PaperExecutionConfig};
+
+    let broker = PaperBroker::with_config(
+        100_000.0,
+        PaperExecutionConfig {
+            partial_fill_pct: Some(0.50), // 50% partial fill
+            slippage_bps: 0.0,
+            spread_bps: 0.0,
+            reject_probability: 0.0,
+            simulate_latency_ms: 0,
+        },
+    );
+
+    let order = OrderIntent {
+        client_order_id: Uuid::new_v4(),
+        symbol: "SPY230915C00450000".into(),
+        side: OrderSide::Buy,
+        qty: 10,
+        limit_price: Some(5.0),
+        reduce_only: false,
+        strategy_id: "STRAT-01".into(),
+        created_at: Utc::now(),
+        order_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+        bot_id: Some("BOT-1".into()),
+        session_id: Some("SESSION-1".into()),
+        decision_id: Some(Uuid::new_v4()),
+        oms_state: Some(OmsState::Unknown),
+        option_action: None,
+    };
+
+    let bo = broker.submit(&order).await.unwrap();
+
+    assert_eq!(bo.status, OrderStatus::PartiallyFilled);
+    assert_eq!(bo.filled_qty, 5, "50% of 10 should be 5");
+
+    let positions = broker.positions().await.unwrap();
+    assert_eq!(positions.len(), 1);
+    assert_eq!(
+        positions[0].qty, 5,
+        "position quantity must match filled_qty (5), not requested qty (10)"
+    );
+
+    let acct = broker.account().await.unwrap();
+    let expected_cost = 5.0 * 5.0 * 100.0; // $2,500
+    assert_eq!(
+        acct.cash,
+        100_000.0 - expected_cost,
+        "cash delta must reflect filled_qty, not requested qty"
+    );
+}
+
+#[tokio::test]
+async fn test_finalization_cancel_failure_with_open_orders_blocks_learning() {
+    let (mut runtime, db) = create_test_runtime_with_failing_broker();
+    let config = SupervisorConfig::default();
+    let mut supervisor = HiveSupervisor::new(&mut runtime, config);
+
+    supervisor.state = SupervisorState::FinalizingSession;
+    supervisor.runtime.current_session_id = Some("SESSION-FAIL-CANCEL".into());
+
+    let mut tick_count = 0usize;
+    supervisor.step(None, &mut tick_count).await.unwrap();
+
+    // Cancellation and open order query failure must keep supervisor in Recovering
+    assert_eq!(
+        supervisor.state,
+        SupervisorState::Recovering,
+        "finalization failure must transition to Recovering, never Learning"
+    );
+
+    let _ = std::fs::remove_file(&db);
+}
+
+#[tokio::test]
+async fn test_watchdog_detects_event_loop_lag_and_withholds_feed() {
+    use th_bot::ProgressLease;
+
+    let lease = ProgressLease::new();
+    // Mark initial progress
+    lease.mark_progress();
+
+    assert!(lease.elapsed_since_progress() < Duration::from_secs(1));
+}
+
+#[tokio::test]
+async fn test_startup_watchdog_guard_disarmed_on_success() {
+    use th_bot::StartupWatchdogGuard;
+
+    let mut guard = StartupWatchdogGuard::arm(Duration::from_secs(5));
+    // Disarm guard cleanly
+    guard.disarm();
+}

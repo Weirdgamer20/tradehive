@@ -2054,7 +2054,19 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
         println!("PRE_MARKET_ANALYSIS_STARTED session_id={session_id}");
 
         // Reconcile broker positions and retire previous session bots before manufacturing
-        let _ = self.reconcile().await;
+        match self.reconcile().await {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(RuntimeError::Execution(
+                    "reconciliation_position_mismatch_at_pre_market".into(),
+                ));
+            }
+            Err(e) => {
+                return Err(RuntimeError::Execution(format!(
+                    "reconciliation_error_at_pre_market: {e}"
+                )));
+            }
+        }
         self.fleet.retire_all();
         self.bot_plans.clear();
 
@@ -2342,15 +2354,24 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                         t.symbol, t.underlying, bo.filled_qty, remaining.qty, pnl
                     );
                 }
-                OrderStatus::New | OrderStatus::Accepted => {
+                OrderStatus::New | OrderStatus::Accepted | OrderStatus::PendingCancel => {
                     println!(
                         "POSITION_CLOSE_PENDING symbol={} underlying={} status={:?}",
                         t.symbol, t.underlying, bo.status
                     );
                 }
-                OrderStatus::Cancelled | OrderStatus::Rejected => {
+                OrderStatus::Cancelled | OrderStatus::Rejected | OrderStatus::Expired => {
                     println!(
                         "POSITION_CLOSE_REJECTED symbol={} underlying={} status={:?}",
+                        t.symbol, t.underlying, bo.status
+                    );
+                    self.active = false;
+                    self.health = RuntimeHealth::Degraded;
+                    self.execution.risk_mut().engage_kill_switch();
+                }
+                OrderStatus::Replaced | OrderStatus::Unknown => {
+                    println!(
+                        "POSITION_CLOSE_AMBIGUOUS symbol={} underlying={} status={:?}",
                         t.symbol, t.underlying, bo.status
                     );
                     self.active = false;
@@ -2392,7 +2413,19 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
     ) -> Result<(), RuntimeError> {
         println!("POST_MARKET session_id={session_id}");
 
-        let _ = self.reconcile().await;
+        match self.reconcile().await {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(RuntimeError::Execution(
+                    "reconciliation_position_mismatch_at_post_market".into(),
+                ));
+            }
+            Err(e) => {
+                return Err(RuntimeError::Execution(format!(
+                    "reconciliation_error_at_post_market: {e}"
+                )));
+            }
+        }
         let account = self.execution.broker().await.ok();
         let equity = account.as_ref().map(|a| a.equity).unwrap_or(0.0);
         let cash = account.as_ref().map(|a| a.cash).unwrap_or(0.0);

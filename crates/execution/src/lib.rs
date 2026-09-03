@@ -213,17 +213,18 @@ impl Broker for PaperBroker {
                 contract: th_domain::OptionContract::from_occ(&o.symbol),
             });
             let old = e.qty.max(0) as f64;
+            let fill_f = fill_qty as f64;
             e.avg_price = if old > 0.0 {
-                (e.avg_price * old + px * o.qty as f64) / (old + o.qty as f64)
+                (e.avg_price * old + px * fill_f) / (old + fill_f)
             } else {
                 px
             };
-            e.qty += o.qty as i32;
+            e.qty += fill_qty as i32;
             e.mark = px
         } else if let Some(e) = s.positions.get_mut(&o.symbol) {
-            e.qty -= o.qty as i32;
+            e.qty -= fill_qty as i32;
             e.mark = px;
-            if e.qty == 0 {
+            if e.qty <= 0 {
                 s.positions.remove(&o.symbol);
             }
         }
@@ -402,8 +403,11 @@ fn parse_status(s: &str) -> OrderStatus {
         "partially_filled" => OrderStatus::PartiallyFilled,
         "filled" => OrderStatus::Filled,
         "canceled" | "cancelled" => OrderStatus::Cancelled,
-        "rejected" | "expired" => OrderStatus::Rejected,
-        _ => OrderStatus::New,
+        "rejected" => OrderStatus::Rejected,
+        "expired" => OrderStatus::Expired,
+        "replaced" => OrderStatus::Replaced,
+        "pending_cancel" => OrderStatus::PendingCancel,
+        _ => OrderStatus::Unknown,
     }
 }
 #[async_trait]

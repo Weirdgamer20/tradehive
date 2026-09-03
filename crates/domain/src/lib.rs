@@ -335,6 +335,30 @@ pub enum OrderStatus {
     Filled,
     Cancelled,
     Rejected,
+    Expired,
+    Replaced,
+    PendingCancel,
+    Unknown,
+}
+
+impl OrderStatus {
+    pub fn is_working(&self) -> bool {
+        matches!(
+            self,
+            Self::New | Self::Accepted | Self::PartiallyFilled | Self::PendingCancel
+        )
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::Filled | Self::Cancelled | Self::Rejected | Self::Expired
+        )
+    }
+
+    pub fn requires_reconciliation(&self) -> bool {
+        matches!(self, Self::Unknown | Self::Replaced)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
