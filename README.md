@@ -1,217 +1,125 @@
 # TradingHive v0.9.0
 
-A high-performance algorithmic trading bot written in Rust.
+> **Submission Document**: See [**ONE_PAGE_WRITEUP.md**](ONE_PAGE_WRITEUP.md) for the complete one-page architectural write-up detailing our **AI Logic**, **Deterministic Risk Gates**, and **Alpaca Infrastructure Implementation**.
 
-## Features
-
-- **Automated Trading**: Execute trades on Alpaca markets during 8 PM - 12 AM ET (4-hour session)
-- **Reinforcement Learning**: Q-Learning based signal generation with continuous market adaptation
-- **Risk Management**: Position limits, stop-loss, take-profit controls, and portfolio risk governance
-- **Live Trading**: Test strategies risk-free before deploying real capital
-- **Real-Time Data**: 1-minute candle aggregation from Alpaca WebSocket
-- **Persistent Storage**: SQLite database with audit trail and backtesting data
-- **Production Ready**: Zero panics, comprehensive error handling, fail-closed safety design
-
-## Quick Start
-
-### Prerequisites
-- Rust 1.70+ (see [INSTALL.md](INSTALL.md) for setup)
-- Alpaca paper trading account (free)
-- Git
-
-### Paper Trading (Safe Testing)
-```bash
-# 1. Clone the repository
-git clone <repository-url>
-cd TradingHive-Rust-V17
-
-# 2. Set up credentials (no real money)
-cp .env.example .env
-# Edit .env with your Alpaca paper credentials
-
-# 3. Run trading session
-cargo run --release -- session
-
-# That's it! Trading starts at 20:00 ET daily
-```
-
-### Live Trading (Real Money)
-```bash
-# 1. Set environment variable (requires explicit confirmation)
-export TRADING_HIVE_LIVE_CONFIRM=YES  # Linux/Mac
-set TRADING_HIVE_LIVE_CONFIRM=YES     # Windows
-
-# 2. Ensure live credentials in .env
-APCA_API_KEY_ID=your_live_key
-APCA_API_SECRET_KEY=your_live_secret
-
-# 3. Run with live confirmation
-cargo run --release -- session
-
-# ⚠️  WARNING: Real money will be traded. Verify everything first.
-```
-
-## Configuration
-
-Create `.env` file from `.env.example`:
-
-```env
-# Broker Credentials
-APCA_API_KEY_ID=REPLACE_WITH_PAPER_OR_LIVE_KEY
-APCA_API_SECRET_KEY=REPLACE_WITH_PAPER_OR_LIVE_SECRET
-
-# Paper vs Live
-TRADING_HIVE_LIVE_CONFIRM=NO  # Change to YES for live trading
-
-# Database
-TRADING_HIVE_DB=trading_hive.sqlite
-
-# Risk Parameters (0.0 = disabled)
-TRADING_STOP_LOSS_PCT=0.05      # 5% stop-loss
-TRADING_TAKE_PROFIT_PCT=0.0     # Disabled
-```
-
-## Commands
-
-```bash
-# View all available strategies
-cargo run --release -- strategies
-
-# Analyze market data
-cargo run --release -- analyze <num_bars>
-
-# Run RL training on live data
-cargo run --release -- rl-live SPY,QQQ,IWM
-
-# Run trading session (default: paper mode)
-cargo run --release -- session
-
-# Run test suite
-cargo test --all
-
-# Format code
-cargo fmt --all
-
-# Check for issues
-cargo clippy --all
-```
-
-## Architecture
-
-- **crates/domain**: Core financial types and validation
-- **crates/execution**: Broker abstraction (Alpaca + paper trading)
-- **crates/market-data**: Real-time market data streaming
-- **crates/strategy**: Trading signal generation
-- **crates/risk**: Portfolio risk management and limits
-- **crates/hive**: Reinforcement learning engine
-- **crates/storage**: SQLite persistence layer
-- **crates/bot**: Runtime configuration and trading logic
-- **crates/cli**: Command-line interface
-
-## Safety Features
-
-- ✅ **Fail-Closed Design**: Defaults to safe mode
-- ✅ **Explicit Live Confirmation**: Requires environment variable to go live
-- ✅ **Triple-Layer Verification**: Credentials + endpoint + confirmation gate
-- ✅ **Kill Switch**: Stops trading if issues detected
-- ✅ **Position Reconciliation**: Verifies DB matches broker
-- ✅ **No Panics**: All errors handled gracefully
-
-## Performance
-
-- **Binary Size**: 6.5 MB (release build)
-- **Startup Time**: <1 second
-- **Market Update Latency**: <100ms
-- **Order Submission**: <500ms (paper), <1000ms (live)
-- **Memory Usage**: 50-150 MB typical
-
-## System Requirements
-
-| OS | Min | Recommended |
-|----|-----|-------------|
-| Windows | 8 GB RAM, 2 GB disk | 16 GB RAM, SSD |
-| Linux | 4 GB RAM, 2 GB disk | 8 GB RAM, SSD |
-| macOS | 4 GB RAM, 2 GB disk | 8 GB RAM, SSD |
-
-## Supported Platforms
-
-- ✅ Windows (10, 11)
-- ✅ Linux (Ubuntu 18.04+, other distros)
-- ✅ macOS (10.15+, ARM/Intel)
-
-See [INSTALL.md](INSTALL.md) for platform-specific setup.
-
-## Testing
-
-```bash
-# Run all tests
-cargo test --all
-
-# Run with output
-cargo test --all -- --nocapture
-
-# Run specific test
-cargo test --test integration_tests
-
-# Check test coverage
-cargo tarpaulin --all
-```
-
-All 11 unit tests pass. See `cargo test --all` for details.
-
-## Troubleshooting
-
-### Issue: "can't find crate for `std`"
-**Solution**: Run `rustup update stable --force-non-host`
-
-### Issue: "TRADING_HIVE_LIVE_CONFIRM required"
-**Solution**: Set environment variable before trading live
-```bash
-export TRADING_HIVE_LIVE_CONFIRM=YES  # Linux/Mac
-set TRADING_HIVE_LIVE_CONFIRM=YES     # Windows
-```
-
-### Issue: Database locked
-**Solution**: Ensure only one trading session running. Check for stale processes.
-
-### Issue: Market closed error during trading hours
-**Solution**: Verify Alpaca API status at status.alpaca.markets
-
-## Getting Help
-
-1. Check `.env` configuration
-2. Run `cargo test --all` to verify system
-3. Review logs in `hive-3hr.log`
-4. Check Alpaca API status
-
-## Contributing
-
-1. Create a feature branch
-2. Make changes and run `cargo fmt` + `cargo clippy`
-3. Ensure all tests pass: `cargo test --all`
-4. Submit pull request
-
-## License
-
-See LICENSE file for details.
-
-## Disclaimer
-
-TradingHive is provided "as is" for educational and research purposes. Trading involves financial risk:
-
-- ⚠️ **Paper Trading Only**: Test thoroughly with simulated money first
-- ⚠️ **Risk Management**: Never trade more than you can afford to lose
-- ⚠️ **Past Performance**: Historical results don't guarantee future performance
-- ⚠️ **Live Trading Confirmation**: Requires explicit environment variable confirmation
-
-## References
-
-- [Alpaca Trading API](https://alpaca.markets/docs)
-- [Rust Book](https://doc.rust-lang.org/book/)
-- [Tokio Async Runtime](https://tokio.rs/)
+A production-grade, 24/7 autonomous quantitative trading runtime and reinforcement learning system written entirely in Rust.
 
 ---
 
-**Version**: 0.9.0  
-**Last Updated**: 2026-09-02  
-**Status**: Production Ready ✅
+## Autonomous 24/7 Architecture
+
+TradingHive operates continuously without requiring human operators to supply daily symbols, trading signals, or session commands. The Hive autonomously manages its entire lifecycle synchronized to the authoritative **NYSE / US Eastern Market Clock**:
+
+```
+PRE-MARKET (08:30 - 09:30 ET)
+  ↓ Dynamic Alpaca screener asset discovery (top volume US equities)
+  ↓ Load prior RL session Q-table & state transfer
+  ↓ Manufacture & fund dedicated worker bots per instrument
+MARKET OPEN (09:30 - 15:55 ET)
+  ↓ Ingest 1-minute bars & OCC options chains from Alpaca
+  ↓ Live Q-policy decision gating (regime-aware signal filtering)
+  ↓ Worker options sizing & deterministic portfolio risk governor
+  ↓ Idempotent order execution via Alpaca REST/WebSocket
+MARKET CLOSING (15:55 - 16:00 ET)
+  ↓ Stop new entries
+  ↓ Mandatory position flattening via reduce_only market orders (zero overnight gap risk)
+POST-MARKET (16:00 - 16:30 ET)
+  ↓ Reconcile broker positions & retire bot fleet
+  ↓ Package complete session dataset into SQLite & JSON audit history
+LEARNING PIPELINE (16:30 - 17:30 ET)
+  ↓ Session-scoped tabular Q-learning on realized outcomes
+  ↓ Synthesize & out-of-sample validate new candidate strategy blueprints
+  ↓ Persist learned state for next day's Pre-Market cycle
+WAITING FOR NEXT SESSION (17:30 - 08:30 ET)
+  ↓ Low-power heartbeat daemon; awakens automatically at 08:30 ET
+```
+
+---
+
+## Quick Start
+
+### 1. Prerequisites
+- Rust 1.70+ (stable toolchain)
+- Alpaca paper or live trading account
+
+### 2. Configure Environment
+Copy `.env.example` to `.env` and fill in your Alpaca API credentials:
+```bash
+cp .env.example .env
+```
+
+```env
+# Alpaca Credentials
+APCA_API_KEY_ID=your_alpaca_key_id
+APCA_API_SECRET_KEY=your_alpaca_secret_key
+ALPACA_DATA_URL=https://data.alpaca.markets
+
+# Safety & Mode Configuration
+TRADING_HIVE_LIVE_CONFIRM=NO    # NO = Paper trading (safe), YES = Live trading
+TRADING_STOP_LOSS_PCT=0.05      # 5% maximum stop loss per contract
+TRADING_TAKE_PROFIT_PCT=0.10     # 10% take profit target
+HIVE_DISCOVERY_LIMIT=200        # Candidates to scan via Alpaca screener
+HIVE_UNIVERSE_SIZE=10           # Maximum active symbols traded per session
+```
+
+### 3. Launch Autonomous Runtime
+Run the autonomous executable with **zero arguments**:
+
+```bash
+# Release binary execution:
+.\target\release\trading-hive.exe
+
+# Or via Cargo in development:
+cargo run --release
+```
+
+The process remains alive indefinitely, monitoring market hours and running the full cycle autonomously.
+
+---
+
+## Key Subsystems
+
+| Subsystem | Responsibility |
+|---|---|
+| **AI & RL Engine** (`crates/hive`) | Tabular Q-learning with discrete regime state representation, live supervisory decision gating, online Bellman updates, and evolutionary strategy blueprint synthesis. |
+| **Deterministic Risk Governor** (`crates/risk`) | Multi-layer safety controls: gross/net portfolio limits, symbol concentration caps, daily drawdown circuit breaker, consecutive loss limiters, and kill switch. Strategy AI has zero authority to bypass risk rules. |
+| **Alpaca Infrastructure** (`crates/market-data`, `crates/execution`) | Real-time 1m candle aggregation, OCC option chain fetching, dynamic screener asset discovery (`/v1beta1/screener/stocks/most-actives`), idempotent order routing with UUID tracking, and broker position reconciliation. |
+| **Storage & Audit Trail** (`crates/storage`, `crates/memory`) | Write-ahead logged SQLite event store capturing all market events, orders, fills, and session-tagged `TRADE_AUTOPSY` records. JSON audit trail for model reproducibility. |
+| **Bot Fleet Manager** (`crates/bot`, `crates/deployment`) | Dynamically manufactures, funds, activates, and retires specialized worker bots each session without global state leakage. |
+
+---
+
+## Safety Features
+
+- 🛡️ **Fail-Closed by Design**: Missing credentials, unavailable market data, or clock drift halts trading immediately.
+- 🛡️ **Triple-Layer Live Confirmation**: Production execution requires valid keys, production endpoint, and explicit `TRADING_HIVE_LIVE_CONFIRM=YES`.
+- 🛡️ **Zero Overnight Risk**: Every position is flattened before 16:00 ET.
+- 🛡️ **Pre- & Post-Trade Reconciliation**: Local state is reconciled with Alpaca broker positions before and after every session.
+- 🛡️ **Strict Idempotency**: All orders use deterministic client order IDs preventing duplicate order submission.
+
+---
+
+## Verification & Testing
+
+Run the full certification and lifecycle test suite:
+
+```bash
+# Run the 24/7 autonomous lifecycle state machine test suite:
+cargo test -p th-bot --test autonomous_lifecycle
+
+# Run the 16-point production certification suite:
+cargo test -p trading-hive --test certification_suite
+
+# Run the entire workspace test suite across all 19 crates:
+cargo test --workspace --all-targets --all-features
+
+# Verify formatting and lints:
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+```
+
+---
+
+## System Write-Up & Documentation
+- [**ONE_PAGE_WRITEUP.md**](ONE_PAGE_WRITEUP.md): One-page submission write-up covering AI logic, risk gates, and Alpaca infrastructure.
+- [**INSTALL.md**](INSTALL.md): Comprehensive platform installation instructions.

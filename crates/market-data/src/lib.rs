@@ -39,6 +39,9 @@ pub trait MarketDataProvider: Send + Sync {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> Result<Vec<NewsEvent>, MarketDataError>;
+    /// Returns the most active tradable US equity symbols by volume.
+    /// Used by the Hive for Stage 1 universe discovery during pre-market.
+    async fn most_actives(&self, limit: usize) -> Result<Vec<String>, MarketDataError>;
 }
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct NewsEvent {
@@ -436,6 +439,27 @@ impl MarketDataProvider for AlpacaProvider {
         out.sort_by_key(|n| n.created_at);
         Ok(out)
     }
+    async fn most_actives(&self, limit: usize) -> Result<Vec<String>, MarketDataError> {
+        let url = format!(
+            "{}/v1beta1/screener/stocks/most-actives?top={}&by=volume",
+            self.cfg.data_url.trim_end_matches('/'),
+            limit
+        );
+        let resp: MostActivesResponse = self.get_json(&url).await?;
+        Ok(resp
+            .most_actives
+            .into_iter()
+            .map(|e| e.symbol)
+            .collect())
+    }
+}
+#[derive(Deserialize)]
+struct MostActivesResponse {
+    most_actives: Vec<MostActiveEntry>,
+}
+#[derive(Deserialize)]
+struct MostActiveEntry {
+    symbol: String,
 }
 #[derive(Debug)]
 pub struct MultiSymbolCandleEngine {
@@ -536,6 +560,10 @@ pub fn synthetic_option_chain(underlying: &str, spot: f64, now: DateTime<Utc>) -
 pub struct SyntheticProvider;
 #[async_trait]
 impl MarketDataProvider for SyntheticProvider {
+    async fn most_actives(&self, _limit: usize) -> Result<Vec<String>, MarketDataError> {
+        // Test stub: returns a small fixed universe for deterministic tests
+        Ok(vec!["SPY".into(), "QQQ".into(), "IWM".into()])
+    }
     async fn bars(
         &self,
         symbol: &str,

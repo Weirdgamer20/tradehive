@@ -365,6 +365,8 @@ pub struct TradingRuntime<B: Broker, P: MarketDataProvider> {
     pub current_session_id: Option<String>,
     pub active_universe: Vec<String>,
     pub phase_override: Option<SessionPhase>,
+    /// Live Q-policy loaded from the previous session. Consulted at every trading tick.
+    pub q_policy: Option<QLearning>,
 }
 impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
     pub fn new(cfg: RuntimeConfig, broker: B, provider: P) -> Result<Self, RuntimeError> {
@@ -493,6 +495,7 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
             current_session_id: None,
             active_universe: Vec::new(),
             phase_override: None,
+            q_policy: None,
             cfg: RuntimeConfig {
                 config_version: active_version,
                 ..cfg
@@ -577,27 +580,55 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
         self.store
             .candle(&candle)
             .map_err(|e| RuntimeError::Storage(e.to_string()))?;
-        let history = self.bars.entry(candle.symbol.clone()).or_default();
-        history.push(candle.clone());
-        if history.len() > self.cfg.max_bars_memory {
-            let n = history.len() - self.cfg.max_bars_memory;
-            history.drain(0..n);
-        }
-        if self.cfg.phase_at(now) != SessionPhase::Trading
-            || !self.active
-            || !th_domain::MarketSessionClock::default().is_open(now)
         {
+            let history = self.bars.entry(candle.symbol.clone()).or_default();
+            history.push(candle.clone());
+            if history.len() > self.cfg.max_bars_memory {
+                let n = history.len() - self.cfg.max_bars_memory;
+                history.drain(0..n);
+            }
+        }
+        if self.market_session_phase(now) != SessionPhase::MarketOpen || !self.active {
             return Ok(());
         }
-        let snapshot = history.clone();
+        let snapshot = self.bars.get(&candle.symbol).cloned().unwrap_or_default();
         let state = classify_regime(&snapshot);
         self.manage_open_trade(&candle.symbol, &state).await?;
+        // Consult the live Q-policy to determine the preferred action for the current regime.
+        // The Q-policy suppresses or permits buy/sell signals; it does NOT bypass risk controls.
+        let state_key = th_hive::StateKey::from_state(&state);
+        let q_action = self.q_policy.as_mut().and_then(|q| {
+            q.choose(
+                &state_key,
+                &[
+                    "Buy".to_string(),
+                    "Sell".to_string(),
+                    "Hold".to_string(),
+                    "Exit".to_string(),
+                ],
+            )
+        });
+        let q_permits_buy = q_action.as_deref() != Some("Hold")
+            && q_action.as_deref() != Some("Exit")
+            && q_action.as_deref() != Some("Sell");
         let mut signals = Vec::new();
         for strategy in self.strategies.iter_mut() {
             if let Some(sig) = strategy.update(&candle, &state) {
+                // Gate long entries by Q-policy. Short/flat signals always pass through.
+                let is_long_entry = matches!(
+                    sig.side,
+                    th_domain::SignalSide::LongCall | th_domain::SignalSide::LongPut
+                );
+                if is_long_entry && !q_permits_buy {
+                    println!(
+                        "SIGNAL_SUPPRESSED_BY_Q symbol={} strategy_id={} side={:?} q_action={:?}",
+                        sig.symbol, sig.strategy_id, sig.side, q_action
+                    );
+                    continue;
+                }
                 println!(
-                    "SIGNAL_GENERATED symbol={} strategy_id={} side={:?} strength={:.2}",
-                    sig.symbol, sig.strategy_id, sig.side, sig.strength
+                    "SIGNAL_GENERATED symbol={} strategy_id={} side={:?} strength={:.2} q_action={:?}",
+                    sig.symbol, sig.strategy_id, sig.side, sig.strength, q_action
                 );
                 signals.push(sig)
             }
@@ -818,6 +849,10 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                         trade_id: format!("TRADE-{}", order.client_order_id),
                         symbol: t.underlying.clone(),
                         strategy_id: t.strategy_id.clone(),
+                        session_id: self
+                            .current_session_id
+                            .clone()
+                            .unwrap_or_default(),
                         entry: t.entry_ts,
                         exit: Some(Utc::now()),
                         pnl,
@@ -830,6 +865,24 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                             "time_limit".into()
                         },
                     };
+                    // Online Q-table update: immediately reflect this trade outcome.
+                    if let Some(q) = self.q_policy.as_mut() {
+                        if let Some(bars) = self.bars.get(&t.underlying) {
+                            let cur_state =
+                                th_hive::StateKey::from_state(&classify_regime(bars));
+                            let action = if pnl > 0.0 { "Buy" } else { "Hold" };
+                            let experience = th_hive::Experience {
+                                state: cur_state.clone(),
+                                action: action.to_string(),
+                                reward: pnl.clamp(-1.0, 1.0),
+                                next_state: cur_state,
+                                terminal: true,
+                                decision_ts: t.entry_ts,
+                                outcome_ts: Utc::now(),
+                            };
+                            q.update(&experience);
+                        }
+                    }
                     self.experience.record_trade(trade.clone());
                     let autopsy = self.experience.autopsy(&trade);
                     self.store
@@ -899,13 +952,12 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
             th_domain::SignalSide::Flat => return Ok(()),
         };
         let now = Utc::now();
-        let market_clock = th_domain::MarketSessionClock::default();
-        if !market_clock.is_open(now) {
+        if self.market_session_phase(now) != SessionPhase::MarketOpen {
             println!(
-                "MARKET_CLOSED session_state={:?}",
-                market_clock.session_state_at(now)
+                "MARKET_NOT_OPEN phase={:?}",
+                self.market_session_phase(now)
             );
-            return Err(RuntimeError::Market("MARKET_CLOSED".into()));
+            return Err(RuntimeError::Market("MARKET_NOT_OPEN".into()));
         }
         let expiry_policy = th_domain::OptionExpiryPolicy::new(
             plan.min_expiry_minutes.max(180),
@@ -1348,7 +1400,12 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
         report: &AnalysisBundle,
         now: DateTime<Utc>,
     ) -> Result<bool, RuntimeError> {
-        if self.cfg.phase_at(now) != SessionPhase::Analysis {
+        // Research config is staged during pre-market analysis or while waiting for next session.
+        let phase = self.market_session_phase(now);
+        if phase != SessionPhase::PreMarket
+            && phase != SessionPhase::WaitingForNextSession
+            && phase != SessionPhase::Analysis
+        {
             return Err(RuntimeError::WrongPhase);
         }
         if report.promoted.is_empty() {
@@ -1460,13 +1517,58 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
         &mut self,
         now: DateTime<Utc>,
     ) -> Result<Vec<String>, RuntimeError> {
+        let discovery_limit = std::env::var("HIVE_DISCOVERY_LIMIT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(200);
+        let universe_size = std::env::var("HIVE_UNIVERSE_SIZE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(self.cfg.max_universe_size.max(1));
+
+        println!("UNIVERSE_DISCOVERY_STARTED discovery_limit={discovery_limit} universe_size={universe_size}");
+
+        // Stage 1: Discover candidates from Alpaca most-actives screener.
+        // Falls back to HIVE_CANDIDATE_UNIVERSE env var if explicitly set (for testing/override).
+        let candidates: Vec<String> =
+            if let Ok(override_syms) = std::env::var("HIVE_CANDIDATE_UNIVERSE")
+                .or_else(|_| std::env::var("HIVE_MARKET_UNIVERSE"))
+                .or_else(|_| std::env::var("TRADING_UNIVERSE"))
+            {
+                let syms: Vec<String> = override_syms
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_uppercase)
+                    .collect();
+                println!("UNIVERSE_OVERRIDE_ACTIVE symbols={syms:?}");
+                syms
+            } else {
+                match self.provider.most_actives(discovery_limit).await {
+                    Ok(syms) if !syms.is_empty() => {
+                        println!("UNIVERSE_DISCOVERY_COMPLETED candidates={}", syms.len());
+                        syms
+                    }
+                    Ok(_) => {
+                        return Err(RuntimeError::Market(
+                            "most_actives returned empty list; failing closed".into(),
+                        ));
+                    }
+                    Err(e) => {
+                        return Err(RuntimeError::Market(format!(
+                            "UNIVERSE_DISCOVERY_FAILED: {e}; failing closed"
+                        )));
+                    }
+                }
+            };
+
+        // Stage 2: Fetch bars for each candidate and rank by volume.
         println!(
             "UNIVERSE_SELECTION_STARTED candidates={:?}",
-            self.cfg.candidate_universe
+            candidates
         );
         let mut liquid_symbols: Vec<(String, f64)> = Vec::new();
-
-        for sym in &self.cfg.candidate_universe {
+        for sym in &candidates {
             let end = now;
             let start = end - chrono::Duration::days(5);
             match self.provider.bars(sym, start, end).await {
@@ -1493,7 +1595,7 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
         liquid_symbols.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         let selected: Vec<String> = liquid_symbols
             .into_iter()
-            .take(self.cfg.max_universe_size.max(1))
+            .take(universe_size)
             .map(|(s, _)| s)
             .collect();
 
@@ -1813,10 +1915,35 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
         println!("PRE_MARKET_ANALYSIS_STARTED session_id={session_id}");
 
         let prior_rl = self.json_history.latest_rl_session().unwrap_or(None);
-        let trade_records = self
-            .store
-            .trade_records_since(&(now - chrono::Duration::days(7)).to_rfc3339())
-            .unwrap_or_default();
+
+        // Load Q-policy from the previous session for live decision coupling.
+        self.q_policy = prior_rl.as_ref().and_then(|r| {
+            serde_json::from_value::<Vec<th_hive::QEntry>>(serde_json::Value::Array(
+                r.q_table_snapshot.clone(),
+            ))
+            .ok()
+            .filter(|entries| !entries.is_empty())
+            .map(|entries| QLearning::from_entries(&entries))
+        });
+        let q_entries = self
+            .q_policy
+            .as_ref()
+            .map(|q| q.q.len())
+            .unwrap_or(0);
+        println!("RL_STATE_LOADED entries={q_entries}");
+
+        // Use previous session's trade records for pre-market analysis context.
+        let prior_session_id = prior_rl.as_ref().map(|r| r.session_id.clone());
+        let trade_records = if let Some(ref sid) = prior_session_id {
+            self.store
+                .trade_records_for_session(sid)
+                .unwrap_or_default()
+        } else {
+            // First ever run: scan last 7 days as bootstrap
+            self.store
+                .trade_records_since(&(now - chrono::Duration::days(7)).to_rfc3339())
+                .unwrap_or_default()
+        };
         let portfolio = self
             .execution
             .broker()
@@ -1829,11 +1956,6 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
             trade_records.len(),
             portfolio
         );
-        let q_entries = prior_rl
-            .as_ref()
-            .map(|r| r.q_table_snapshot.len())
-            .unwrap_or(0);
-        println!("RL_STATE_LOADED entries={}", q_entries);
 
         let selected = if symbols.is_empty() {
             self.select_trading_universe(now).await?
@@ -1871,6 +1993,60 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
         println!("MARKET_CLOSING session_id={session_id}");
         self.active = false;
         println!("TRADING_DISABLED session_id={session_id}");
+
+        // Flatten all open positions before the session is finalized.
+        // Each forced close is recorded as a TRADE_AUTOPSY with reason="session_end"
+        // and tagged with the current session_id so RL can consume them.
+        let open_keys: Vec<String> = self.open_trades.keys().cloned().collect();
+        println!(
+            "FLATTENING_POSITIONS count={} session_id={session_id}",
+            open_keys.len()
+        );
+        for key in open_keys {
+            let Some(t) = self.open_trades.get(&key).cloned() else {
+                continue;
+            };
+            // Get current mark price from option chain; fall back to entry price if unavailable.
+            let mark = if let Ok(chain) = self.provider.option_chain(&t.underlying, Utc::now()).await {
+                chain
+                    .quotes
+                    .iter()
+                    .find(|q| q.symbol == t.symbol)
+                    .map(|q| q.bid)
+                    .unwrap_or(t.entry_price)
+            } else {
+                t.entry_price
+            };
+            let pnl = (mark - t.entry_price) * t.qty as f64 * th_domain::CONTRACT_MULTIPLIER;
+            let trade = TradeRecord {
+                trade_id: format!("TRADE-EOD-{}-{}", session_id, t.symbol),
+                symbol: t.underlying.clone(),
+                strategy_id: t.strategy_id.clone(),
+                session_id: session_id.to_string(),
+                entry: t.entry_ts,
+                exit: Some(Utc::now()),
+                pnl,
+                fees: 0.0,
+                reason: "session_end".into(),
+            };
+            self.experience.record_trade(trade.clone());
+            let autopsy = self.experience.autopsy(&trade);
+            let _ = self.store.event_keyed(
+                &format!("TRADE_AUTOPSY:{}", trade.trade_id),
+                "TRADE_AUTOPSY",
+                &serde_json::json!({"trade": trade, "autopsy": autopsy}),
+            );
+            self.stats.trades_closed += 1;
+            self.stats.realized_pnl += pnl;
+            self.open_trades.remove(&key);
+            let _ = self.store.delete_open_trade(&key);
+            println!(
+                "POSITION_FORCE_CLOSED symbol={} underlying={} pnl={:.2} reason=session_end",
+                t.symbol, t.underlying, pnl
+            );
+        }
+
+        println!("POSITIONS_FLATTENED session_id={session_id}");
         Ok(())
     }
 
@@ -1923,72 +2099,97 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
         now: DateTime<Utc>,
     ) -> Result<(), RuntimeError> {
         println!("RL_STARTED session_id={session_id}");
+
+        // Use session-scoped trade records — immune to clock drift and stale data.
         let trade_records = self
             .store
-            .trade_records_since(&(now - chrono::Duration::hours(24)).to_rfc3339())
+            .trade_records_for_session(session_id)
             .unwrap_or_default();
 
         if trade_records.is_empty() {
             println!(
                 "RL_STATUS=INSUFFICIENT_DATA session_id={session_id} reason=no_session_trades"
             );
-            return Ok(());
-        }
-
-        let mut histories = HashMap::new();
-        for sym in symbols {
-            if let Some(bars) = self.bars.get(sym) {
-                histories.insert(sym.clone(), bars.clone());
-            }
-        }
-
-        if histories.is_empty() {
-            println!(
-                "RL_STATUS=INSUFFICIENT_DATA session_id={session_id} reason=no_market_histories"
-            );
-            return Ok(());
-        }
-
-        let bundle = run_analysis_with_q_and_trades(
-            histories.clone(),
-            self.prior_q_from_active(),
-            &trade_records,
-        );
-
-        let base_seeds = th_strategy::StrategyRegistry::new().seed_ids();
-        let seed_before = self
-            .json_history
-            .latest_seed_snapshot()
-            .unwrap_or_default()
-            .unwrap_or_else(|| {
-                base_seeds
-                    .iter()
-                    .map(|id| serde_json::json!({"strategy_id": id, "type": "seed"}))
-                    .collect()
-            });
-        let mut seed_after = seed_before.clone();
-        for sa in &bundle.symbols {
-            if let Some(g) = &sa.report.generated_strategy {
-                if g.validation.as_ref().map(|v| v.accepted).unwrap_or(false) {
-                    seed_after.push(serde_json::json!({
-                        "strategy_id": g.blueprint.id,
-                        "type": "rl_promoted",
-                        "blueprint": g.blueprint
-                    }));
+            // Still persist the current Q-policy even if no trades occurred (live updates may exist).
+        } else {
+            let mut histories = HashMap::new();
+            for sym in symbols {
+                if let Some(bars) = self.bars.get(sym) {
+                    histories.insert(sym.clone(), bars.clone());
                 }
             }
+
+            if histories.is_empty() {
+                println!(
+                    "RL_STATUS=INSUFFICIENT_DATA session_id={session_id} reason=no_market_histories"
+                );
+            } else {
+                // Use the live q_policy (which has online updates) as the seed for batch analysis.
+                let bundle = run_analysis_with_q_and_trades(
+                    histories.clone(),
+                    self.q_policy.clone(),
+                    &trade_records,
+                );
+
+                let base_seeds = th_strategy::StrategyRegistry::new().seed_ids();
+                let seed_before = self
+                    .json_history
+                    .latest_seed_snapshot()
+                    .unwrap_or_default()
+                    .unwrap_or_else(|| {
+                        base_seeds
+                            .iter()
+                            .map(|id| serde_json::json!({"strategy_id": id, "type": "seed"}))
+                            .collect()
+                    });
+                let mut seed_after = seed_before.clone();
+                for sa in &bundle.symbols {
+                    if let Some(g) = &sa.report.generated_strategy {
+                        if g.validation.as_ref().map(|v| v.accepted).unwrap_or(false) {
+                            seed_after.push(serde_json::json!({
+                                "strategy_id": g.blueprint.id,
+                                "type": "rl_promoted",
+                                "blueprint": g.blueprint
+                            }));
+                        }
+                    }
+                }
+
+                let _ = th_hive::persist_rl_history(
+                    &self.json_history,
+                    &bundle,
+                    serde_json::json!({"trade_records_used": trade_records.len(), "session_id": session_id}),
+                    seed_before,
+                    seed_after,
+                    serde_json::json!({"symbols": histories.keys().collect::<Vec<_>>()}),
+                );
+
+                println!("RL_COMPLETED session_id={session_id}");
+            }
         }
 
-        let _ = th_hive::persist_rl_history(
-            &self.json_history,
-            &bundle,
-            serde_json::json!({"trade_records_used": trade_records.len()}),
-            seed_before,
-            seed_after,
-            serde_json::json!({"symbols": histories.keys().collect::<Vec<_>>()}),
-        );
+        // Persist the current live Q-policy (including online updates) as a standalone snapshot.
+        // This is what execute_pre_market reloads for the next session.
+        if let Some(q) = &self.q_policy {
+            let entries = q.entries();
+            if !entries.is_empty() {
+                let snapshot: Vec<serde_json::Value> = entries
+                    .iter()
+                    .map(|e| serde_json::to_value(e).unwrap_or_default())
+                    .collect();
+                let _ = self.store.event(
+                    "Q_POLICY_SNAPSHOT",
+                    &serde_json::json!({
+                        "session_id": session_id,
+                        "timestamp": now.to_rfc3339(),
+                        "entries": snapshot.len(),
+                        "q_table": snapshot
+                    }),
+                );
+                println!("Q_POLICY_PERSISTED session_id={session_id} entries={}", entries.len());
+            }
+        }
 
-        println!("RL_COMPLETED session_id={session_id}");
         println!("RL_STATE_PERSISTED session_id={session_id}");
         Ok(())
     }

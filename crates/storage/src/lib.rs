@@ -402,6 +402,31 @@ impl Store {
         }
         Ok(out)
     }
+    pub fn trade_records_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<th_memory::TradeRecord>, StorageError> {
+        let mut st = self
+            .conn
+            .prepare("SELECT payload FROM events WHERE kind='TRADE_AUTOPSY' ORDER BY created_at")?;
+        let rows = st.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let payload = row?;
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&payload) {
+                if let Some(t) = v.get("trade") {
+                    if let Ok(record) =
+                        serde_json::from_value::<th_memory::TradeRecord>(t.clone())
+                    {
+                        if record.session_id == session_id {
+                            out.push(record);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
     pub fn save_bot_plan(&self, p: &BotCreationPlan) -> Result<(), StorageError> {
         self.conn.execute("INSERT OR REPLACE INTO bot_plans(plan_id,bot_id,strategy_id,strategy_version,config_version,underlying,option_symbol,option_type,strike,expiry,capital_allocated,risk_budget,quantity,entry_limit,stop_loss_pct,take_profit_pct,min_expiry_minutes,max_expiry_minutes,allowed_direction,created_at,fingerprint) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",params![p.plan_id,p.bot_id,p.strategy_id,p.strategy_version as i64,p.config_version,p.underlying,p.option_symbol,format!("{:?}",p.option_type),p.strike,p.expiry.to_rfc3339(),p.capital_allocated,p.risk_budget,p.quantity as i64,p.entry_limit,p.stop_loss_pct,p.take_profit_pct,p.min_expiry_minutes as i64,p.max_expiry_minutes as i64,"Any",p.created_at.to_rfc3339(),p.fingerprint])?;
         Ok(())

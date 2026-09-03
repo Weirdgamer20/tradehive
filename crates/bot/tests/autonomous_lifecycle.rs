@@ -31,6 +31,9 @@ impl MarketDataProvider for EmptyBarsProvider {
     ) -> Result<Vec<NewsEvent>, MarketDataError> {
         Ok(vec![])
     }
+    async fn most_actives(&self, _limit: usize) -> Result<Vec<String>, MarketDataError> {
+        Ok(vec![])
+    }
 }
 
 #[test]
@@ -211,6 +214,7 @@ async fn test_closed_loop_rl_knowledge_transfer() {
                     trade_id: "T-001".into(),
                     symbol: "SPY".into(),
                     strategy_id: "momentum_spread".into(),
+                    session_id: "SESSION-DAY-1".into(),
                     entry: now - Duration::minutes(30),
                     exit: Some(now - Duration::minutes(5)),
                     pnl: 10.0,
@@ -355,12 +359,8 @@ async fn test_runtime_survives_market_closed_without_terminating() {
     )
     .unwrap();
 
-    // Set clock to closed schedule
-    runtime.market_clock = MarketSessionClock::new(MarketSessionConfig {
-        open_time: chrono::NaiveTime::from_hms_opt(9, 30, 0).unwrap(),
-        close_time: chrono::NaiveTime::from_hms_opt(16, 0, 0).unwrap(),
-        timezone: chrono_tz::America::New_York,
-    });
+    // Explicitly set phase to WaitingForNextSession to verify closed market behavior deterministically
+    runtime.phase_override = Some(SessionPhase::WaitingForNextSession);
 
     // Run for 3 ticks outside market hours: must survive and complete ticks cleanly without error
     let stats = runtime.run_session(&[], Some(3)).await.unwrap();

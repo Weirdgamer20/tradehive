@@ -6,6 +6,7 @@ pub struct TradeRecord {
     pub trade_id: String,
     pub symbol: String,
     pub strategy_id: String,
+    pub session_id: String,
     pub entry: DateTime<Utc>,
     pub exit: Option<DateTime<Utc>>,
     pub pnl: f64,

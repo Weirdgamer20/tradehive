@@ -1,6 +1,25 @@
+# Build artifacts
 target/
+
+# Database files
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
+
+# Environment & credentials
 .env
 .env.example
+
+# Tooling and analysis output
+graphify-out
+
+# Logs and temporary diagnostic files
+*.log
+hive-3hr.log
+bot-manufacture-error.txt
+CLEANUP_SUMMARY.txt
+
+# Local environment and helper scripts
+setup_rust.ps1
+run_cargo.ps1
+scripts_check.sh
