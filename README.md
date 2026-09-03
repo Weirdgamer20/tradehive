@@ -58,8 +58,11 @@ ALPACA_DATA_URL=https://data.alpaca.markets
 TRADING_HIVE_LIVE_CONFIRM=NO    # NO = Paper trading (safe), YES = Live trading
 TRADING_STOP_LOSS_PCT=0.05      # 5% maximum stop loss per contract
 TRADING_TAKE_PROFIT_PCT=0.10     # 10% take profit target
-HIVE_DISCOVERY_LIMIT=200        # Candidates to scan via Alpaca screener
+HIVE_DISCOVERY_LIMIT=99         # Candidates to scan via Alpaca screener (max 99)
 HIVE_UNIVERSE_SIZE=10           # Maximum active symbols traded per session
+HIVE_MAX_BOTS=20                # Global maximum active bot fleet size
+HIVE_MAX_BOTS_PER_SYMBOL=4      # Maximum bot allocation per underlying symbol
+HIVE_MAX_SYMBOL_CAPITAL_PCT=0.25 # Maximum capital concentration per symbol (25%)
 ```
 
 ### 3. Launch Autonomous Runtime

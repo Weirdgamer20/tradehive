@@ -440,17 +440,14 @@ impl MarketDataProvider for AlpacaProvider {
         Ok(out)
     }
     async fn most_actives(&self, limit: usize) -> Result<Vec<String>, MarketDataError> {
+        let top = limit.clamp(1, 99);
         let url = format!(
             "{}/v1beta1/screener/stocks/most-actives?top={}&by=volume",
             self.cfg.data_url.trim_end_matches('/'),
-            limit
+            top
         );
         let resp: MostActivesResponse = self.get_json(&url).await?;
-        Ok(resp
-            .most_actives
-            .into_iter()
-            .map(|e| e.symbol)
-            .collect())
+        Ok(resp.most_actives.into_iter().map(|e| e.symbol).collect())
     }
 }
 #[derive(Deserialize)]

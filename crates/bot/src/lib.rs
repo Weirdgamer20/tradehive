@@ -638,13 +638,15 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                 .signal(&sig)
                 .map_err(|e| RuntimeError::Storage(e.to_string()))?;
             if let Err(e) = self.handle_signal(sig).await {
-                self.stats.rejected_orders += 1;
-                self.store
-                    .event(
-                        "ORDER_REJECTED",
-                        &serde_json::json!({"error":e.to_string()}),
-                    )
-                    .map_err(|x| RuntimeError::Storage(x.to_string()))?;
+                if !matches!(e, RuntimeError::NoOption | RuntimeError::NewsRisk) {
+                    self.stats.rejected_orders += 1;
+                    self.store
+                        .event(
+                            "ORDER_REJECTED",
+                            &serde_json::json!({"error":e.to_string()}),
+                        )
+                        .map_err(|x| RuntimeError::Storage(x.to_string()))?;
+                }
             }
         }
         Ok(())
@@ -849,10 +851,7 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                         trade_id: format!("TRADE-{}", order.client_order_id),
                         symbol: t.underlying.clone(),
                         strategy_id: t.strategy_id.clone(),
-                        session_id: self
-                            .current_session_id
-                            .clone()
-                            .unwrap_or_default(),
+                        session_id: self.current_session_id.clone().unwrap_or_default(),
                         entry: t.entry_ts,
                         exit: Some(Utc::now()),
                         pnl,
@@ -868,8 +867,7 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                     // Online Q-table update: immediately reflect this trade outcome.
                     if let Some(q) = self.q_policy.as_mut() {
                         if let Some(bars) = self.bars.get(&t.underlying) {
-                            let cur_state =
-                                th_hive::StateKey::from_state(&classify_regime(bars));
+                            let cur_state = th_hive::StateKey::from_state(&classify_regime(bars));
                             let action = if pnl > 0.0 { "Buy" } else { "Hold" };
                             let experience = th_hive::Experience {
                                 state: cur_state.clone(),
@@ -953,10 +951,7 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
         };
         let now = Utc::now();
         if self.market_session_phase(now) != SessionPhase::MarketOpen {
-            println!(
-                "MARKET_NOT_OPEN phase={:?}",
-                self.market_session_phase(now)
-            );
+            println!("MARKET_NOT_OPEN phase={:?}", self.market_session_phase(now));
             return Err(RuntimeError::Market("MARKET_NOT_OPEN".into()));
         }
         let expiry_policy = th_domain::OptionExpiryPolicy::new(
@@ -1054,9 +1049,10 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
         };
 
         let safety_ceiling_qty = std::env::var("RISK_POSITION_SAFETY_CEILING")
+            .or_else(|_| std::env::var("RISK_MAX_SINGLE_POSITION_QTY"))
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(u32::MAX);
+            .unwrap_or(self.execution.risk().limits().max_single_position_qty);
         self.execution
             .risk_mut()
             .register_strategy_risk(th_risk::StrategyRiskAllocation {
@@ -1087,7 +1083,12 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
             max_portfolio_risk_pct,
             current_portfolio_risk: portfolio.total_notional() * sl_pct,
             plan_risk_budget: plan.risk_budget,
-            plan_capital_allocated: plan.capital_allocated,
+            plan_capital_allocated: if plan.capital_allocated > 0.0 {
+                plan.capital_allocated
+                    .min(self.execution.risk().limits().max_order_notional)
+            } else {
+                self.execution.risk().limits().max_order_notional
+            },
             safety_ceiling_qty,
             ceiling_action,
         };
@@ -1381,7 +1382,15 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
         let max_bots = std::env::var("HIVE_MAX_BOTS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(3);
+            .unwrap_or(20);
+        let max_bots_per_symbol = std::env::var("HIVE_MAX_BOTS_PER_SYMBOL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4);
+        let max_symbol_capital_pct = std::env::var("HIVE_MAX_SYMBOL_CAPITAL_PCT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.25);
         let risk_fraction = std::env::var("HIVE_RISK_FRACTION")
             .map_err(|_| RuntimeError::InvalidConfig("HIVE_RISK_FRACTION missing".into()))?
             .parse::<f64>()
@@ -1390,6 +1399,8 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
         Ok(HiveManufacturingPolicy {
             total_capital: total,
             max_bots,
+            max_bots_per_symbol,
+            max_symbol_capital_pct,
             risk_fraction,
             min_expiry_minutes: expiry_policy.min_expiry_minutes,
             max_expiry_minutes: expiry_policy.max_expiry_minutes.unwrap_or(u32::MAX),
@@ -1520,7 +1531,8 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
         let discovery_limit = std::env::var("HIVE_DISCOVERY_LIMIT")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(200);
+            .unwrap_or(99)
+            .clamp(1, 99);
         let universe_size = std::env::var("HIVE_UNIVERSE_SIZE")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -1530,43 +1542,40 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
 
         // Stage 1: Discover candidates from Alpaca most-actives screener.
         // Falls back to HIVE_CANDIDATE_UNIVERSE env var if explicitly set (for testing/override).
-        let candidates: Vec<String> =
-            if let Ok(override_syms) = std::env::var("HIVE_CANDIDATE_UNIVERSE")
+        let candidates: Vec<String> = if let Ok(override_syms) =
+            std::env::var("HIVE_CANDIDATE_UNIVERSE")
                 .or_else(|_| std::env::var("HIVE_MARKET_UNIVERSE"))
                 .or_else(|_| std::env::var("TRADING_UNIVERSE"))
-            {
-                let syms: Vec<String> = override_syms
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_uppercase)
-                    .collect();
-                println!("UNIVERSE_OVERRIDE_ACTIVE symbols={syms:?}");
-                syms
-            } else {
-                match self.provider.most_actives(discovery_limit).await {
-                    Ok(syms) if !syms.is_empty() => {
-                        println!("UNIVERSE_DISCOVERY_COMPLETED candidates={}", syms.len());
-                        syms
-                    }
-                    Ok(_) => {
-                        return Err(RuntimeError::Market(
-                            "most_actives returned empty list; failing closed".into(),
-                        ));
-                    }
-                    Err(e) => {
-                        return Err(RuntimeError::Market(format!(
-                            "UNIVERSE_DISCOVERY_FAILED: {e}; failing closed"
-                        )));
-                    }
+        {
+            let syms: Vec<String> = override_syms
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_uppercase)
+                .collect();
+            println!("UNIVERSE_OVERRIDE_ACTIVE symbols={syms:?}");
+            syms
+        } else {
+            match self.provider.most_actives(discovery_limit).await {
+                Ok(syms) if !syms.is_empty() => {
+                    println!("UNIVERSE_DISCOVERY_COMPLETED candidates={}", syms.len());
+                    syms
                 }
-            };
+                Ok(_) => {
+                    return Err(RuntimeError::Market(
+                        "most_actives returned empty list; failing closed".into(),
+                    ));
+                }
+                Err(e) => {
+                    return Err(RuntimeError::Market(format!(
+                        "UNIVERSE_DISCOVERY_FAILED: {e}; failing closed"
+                    )));
+                }
+            }
+        };
 
         // Stage 2: Fetch bars for each candidate and rank by volume.
-        println!(
-            "UNIVERSE_SELECTION_STARTED candidates={:?}",
-            candidates
-        );
+        println!("UNIVERSE_SELECTION_STARTED candidates={:?}", candidates);
         let mut liquid_symbols: Vec<(String, f64)> = Vec::new();
         for sym in &candidates {
             let end = now;
@@ -1704,6 +1713,8 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
             Self::manufacturing_policy_from_env().unwrap_or(th_hive::HiveManufacturingPolicy {
                 total_capital: 1000000.0,
                 max_bots: 20,
+                max_bots_per_symbol: 4,
+                max_symbol_capital_pct: 0.25,
                 risk_fraction: 0.05,
                 min_expiry_minutes: expiry_policy.min_expiry_minutes,
                 max_expiry_minutes: expiry_policy.max_expiry_minutes.unwrap_or(u32::MAX),
@@ -1925,11 +1936,7 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
             .filter(|entries| !entries.is_empty())
             .map(|entries| QLearning::from_entries(&entries))
         });
-        let q_entries = self
-            .q_policy
-            .as_ref()
-            .map(|q| q.q.len())
-            .unwrap_or(0);
+        let q_entries = self.q_policy.as_ref().map(|q| q.q.len()).unwrap_or(0);
         println!("RL_STATE_LOADED entries={q_entries}");
 
         // Use previous session's trade records for pre-market analysis context.
@@ -2007,16 +2014,17 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                 continue;
             };
             // Get current mark price from option chain; fall back to entry price if unavailable.
-            let mark = if let Ok(chain) = self.provider.option_chain(&t.underlying, Utc::now()).await {
-                chain
-                    .quotes
-                    .iter()
-                    .find(|q| q.symbol == t.symbol)
-                    .map(|q| q.bid)
-                    .unwrap_or(t.entry_price)
-            } else {
-                t.entry_price
-            };
+            let mark =
+                if let Ok(chain) = self.provider.option_chain(&t.underlying, Utc::now()).await {
+                    chain
+                        .quotes
+                        .iter()
+                        .find(|q| q.symbol == t.symbol)
+                        .map(|q| q.bid)
+                        .unwrap_or(t.entry_price)
+                } else {
+                    t.entry_price
+                };
             let pnl = (mark - t.entry_price) * t.qty as f64 * th_domain::CONTRACT_MULTIPLIER;
             let trade = TradeRecord {
                 trade_id: format!("TRADE-EOD-{}-{}", session_id, t.symbol),
@@ -2186,7 +2194,10 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                         "q_table": snapshot
                     }),
                 );
-                println!("Q_POLICY_PERSISTED session_id={session_id} entries={}", entries.len());
+                println!(
+                    "Q_POLICY_PERSISTED session_id={session_id} entries={}",
+                    entries.len()
+                );
             }
         }
 
@@ -2618,6 +2629,7 @@ mod generated_strategy_activation_tests {
                     finished: now,
                     evaluations: vec![],
                     promoted: vec![PromotionRecord {
+                        symbol: "SPY".into(),
                         strategy_id: "STRAT-31".into(),
                         version: 1,
                         fingerprint: "fp".into(),
@@ -2635,6 +2647,7 @@ mod generated_strategy_activation_tests {
                 },
             }],
             promoted: vec![PromotionRecord {
+                symbol: "SPY".into(),
                 strategy_id: "STRAT-31".into(),
                 version: 1,
                 fingerprint: "fp".into(),

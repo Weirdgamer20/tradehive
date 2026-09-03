@@ -153,6 +153,7 @@ fn cert_arch_001_zero_directional_authority_in_hive() {
         finished: now,
         evaluations: vec![eval],
         promoted: vec![PromotionRecord {
+            symbol: "SPY".into(),
             strategy_id: "STRAT-01".into(),
             version: 1,
             fingerprint: "fp_strat_01".into(),
@@ -178,6 +179,7 @@ fn cert_arch_001_zero_directional_authority_in_hive() {
             report,
         }],
         promoted: vec![PromotionRecord {
+            symbol: "SPY".into(),
             strategy_id: "STRAT-01".into(),
             version: 1,
             fingerprint: "fp_strat_01".into(),
@@ -190,6 +192,8 @@ fn cert_arch_001_zero_directional_authority_in_hive() {
     let policy = HiveManufacturingPolicy {
         total_capital: 10000.0,
         max_bots: 2,
+        max_bots_per_symbol: 2,
+        max_symbol_capital_pct: 0.50,
         risk_fraction: 0.05,
         min_expiry_minutes: 180,
         max_expiry_minutes: 360,
@@ -546,6 +550,7 @@ fn cert_hist_003_rl_history_transitions_and_q_tables() {
 fn cert_rl_001_002_two_session_reinforcement_learning_demonstration() {
     let test_dir = format!("target/test_rl_demo_{}", Uuid::new_v4());
     std::fs::create_dir_all(&test_dir).unwrap();
+    std::env::set_var("TRADING_HIVE_HISTORY_DIR", &test_dir);
     let json_store = JsonHistoryStore::new(&test_dir).unwrap();
 
     // -------------------------------------------------------------

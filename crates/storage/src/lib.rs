@@ -415,8 +415,7 @@ impl Store {
             let payload = row?;
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&payload) {
                 if let Some(t) = v.get("trade") {
-                    if let Ok(record) =
-                        serde_json::from_value::<th_memory::TradeRecord>(t.clone())
+                    if let Ok(record) = serde_json::from_value::<th_memory::TradeRecord>(t.clone())
                     {
                         if record.session_id == session_id {
                             out.push(record);

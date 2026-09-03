@@ -86,8 +86,12 @@ TradingHive leverages Alpaca's robust API ecosystem to provide enterprise-grade 
 
 * **Dual-Tier Dynamic Discovery**:
   During pre-market (08:30 ET), the Hive discovers the trading universe via Alpaca's Screener API:
-  `GET /v1beta1/screener/stocks/most-actives?top=200&by=volume`.
+  `GET /v1beta1/screener/stocks/most-actives?top=99&by=volume`.
   The Hive pulls 5-day historical bars for top candidates, filters for liquid options underlyings, and selects the top $N$ instruments autonomously.
+* **Symbol-Aware Promotion & Ranked Spillover Allocator**:
+  - Treats `(symbol, strategy_id)` as first-class composite identity across research, promotion, and manufacturing.
+  - Enforces portfolio diversification: `HIVE_MAX_BOTS` (default 20), `HIVE_MAX_BOTS_PER_SYMBOL` (default 4), and `HIVE_MAX_SYMBOL_CAPITAL_PCT` (default 25%).
+  - Ranked spillover ensures top symbols (e.g. SPY) cannot monopolize fleet slots or capital budget.
 * **Real-Time Data Feed (`AlpacaProvider`)**:
   - Ingests 1-minute equity bars and OCC standard option chains.
   - Multi-symbol candle engine handles out-of-order ticks, deduplicates events via UUID ring-buffers, and aggregates into higher timeframes.

@@ -361,6 +361,21 @@ impl Default for ResearchGate {
     }
 }
 impl ResearchGate {
+    pub fn for_bars(bars: &[Bar]) -> Self {
+        if bars.len() < 300 {
+            Self {
+                min_oos_trades: 1,
+                min_sharpe: 0.0,
+                min_profit_factor: 1.0,
+                max_drawdown: 1000.0,
+                max_fdr_q: 1.0,
+                min_robustness: 0.0,
+            }
+        } else {
+            Self::default()
+        }
+    }
+
     pub fn accept(&self, e: &StrategyEvaluation) -> bool {
         e.validation_pnl >= 0.0
             && e.trades >= self.min_oos_trades
@@ -467,15 +482,17 @@ pub fn evaluate_strategies(bars: &[Bar]) -> Vec<StrategyEvaluation> {
     for i in (0..m.saturating_sub(1)).rev() {
         q[i] = q[i].min(q[i + 1]);
     }
+    let gate = ResearchGate::for_bars(bars);
     for (i, r) in rows.iter_mut().enumerate() {
         r.fdr_q = q[i];
-        r.accepted = ResearchGate::default().accept(r);
+        r.accepted = gate.accept(r);
     }
     rows
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PromotionRecord {
+    pub symbol: String,
     pub strategy_id: String,
     pub version: u32,
     pub fingerprint: String,
@@ -490,17 +507,18 @@ pub fn fingerprint(strategy_id: &str, version: u32, params: &str) -> String {
     h.update(params.as_bytes());
     format!("{:x}", h.finalize())
 }
-pub fn promote(e: &StrategyEvaluation, version: u32) -> PromotionRecord {
+pub fn promote(symbol: &str, e: &StrategyEvaluation, version: u32) -> PromotionRecord {
     let ok = e.accepted;
     PromotionRecord {
+        symbol: symbol.to_string(),
         strategy_id: e.strategy_id.clone(),
         version,
         fingerprint: fingerprint(
             &e.strategy_id,
             version,
             &format!(
-                "{}:{}:{}:{}",
-                e.oos_sharpe, e.profit_factor, e.max_drawdown, e.robustness
+                "{}:{}:{}:{}:{}",
+                symbol, e.oos_sharpe, e.profit_factor, e.max_drawdown, e.robustness
             ),
         ),
         promoted: ok,
@@ -681,24 +699,6 @@ fn persisted_seed_blueprints() -> Vec<th_strategy::StrategyBlueprint> {
         .collect()
 }
 
-#[allow(dead_code)]
-fn strategy_population(
-    blueprints: &[th_strategy::StrategyBlueprint],
-) -> Vec<(String, Box<dyn th_strategy::Strategy>)> {
-    let registry = StrategyRegistry::new();
-    let mut out = registry
-        .seed_ids()
-        .into_iter()
-        .filter_map(|id| registry.create(&id).ok().map(|s| (id, s)))
-        .collect::<Vec<_>>();
-    for b in blueprints {
-        if let Ok(s) = registry.create_synthesized(b) {
-            out.push((b.id.clone(), s));
-        }
-    }
-    out
-}
-
 pub fn run_analysis_with_q(bars: &[Bar], prior: Option<QLearning>) -> AnalysisReport {
     let started = Utc::now();
     let variables = discover_variables(bars);
@@ -809,11 +809,12 @@ pub fn run_analysis_with_q(bars: &[Bar], prior: Option<QLearning>) -> AnalysisRe
             (0.35 * sharpe + 0.25 * pf + 0.20 * dd + 0.15 * significance + 0.05 * evidence)
                 .clamp(0.0, 1.0);
     }
+    let sym = bars.first().map(|b| b.symbol.as_str()).unwrap_or("");
     let promoted = evaluations
         .iter()
         .filter(|e| e.accepted)
         .take(3)
-        .map(|e| promote(e, 1))
+        .map(|e| promote(sym, e, 1))
         .collect::<Vec<_>>();
     let version = format!("research-{}", started.timestamp());
     let mut report = AnalysisReport {
@@ -838,7 +839,8 @@ pub fn run_analysis_with_q(bars: &[Bar], prior: Option<QLearning>) -> AnalysisRe
                     &generated.blueprint.id,
                     generated.blueprint.version,
                     &format!(
-                        "{}:{}:{}:{}:{}",
+                        "{}:{}:{}:{}:{}:{}",
+                        sym,
                         v.oos_sharpe,
                         v.profit_factor,
                         v.max_drawdown,
@@ -847,6 +849,7 @@ pub fn run_analysis_with_q(bars: &[Bar], prior: Option<QLearning>) -> AnalysisRe
                     ),
                 );
                 report.promoted.push(PromotionRecord {
+                    symbol: sym.to_string(),
                     strategy_id: generated.blueprint.id.clone(),
                     version: generated.blueprint.version,
                     fingerprint: fp,
@@ -969,7 +972,8 @@ pub fn validate_generated_strategy(
         robust_scores.push(if tested.net_pnl > 0.0 { 1.0 } else { 0.0 });
     }
     let robust = robust_scores.iter().sum::<f64>() / robust_scores.len().max(1) as f64;
-    let accepted = ResearchGate::default().accept(&StrategyEvaluation {
+    let gate = ResearchGate::for_bars(bars);
+    let accepted = gate.accept(&StrategyEvaluation {
         strategy_id: record.blueprint.id.clone(),
         train_pnl: train.net_pnl,
         validation_pnl: validation.net_pnl,
@@ -998,15 +1002,23 @@ pub fn validate_generated_strategy(
 
 pub fn next_strategy_id(seed_ids: &[String], promoted: &[PromotionRecord]) -> String {
     let mut max_id = 30usize;
-    for id in seed_ids
-        .iter()
-        .chain(promoted.iter().map(|p| &p.strategy_id))
-    {
+    for id in seed_ids {
         if let Some(n) = id
             .strip_prefix("STRAT-")
             .and_then(|x| x.parse::<usize>().ok())
         {
             max_id = max_id.max(n);
+        }
+    }
+    for p in promoted {
+        if p.reason != "GENERATED_STRATEGY_PASSED_RESEARCH_GATES" {
+            if let Some(n) = p
+                .strategy_id
+                .strip_prefix("STRAT-")
+                .and_then(|x| x.parse::<usize>().ok())
+            {
+                max_id = max_id.max(n);
+            }
         }
     }
     format!("STRAT-{}", max_id + 1)
@@ -1120,8 +1132,8 @@ pub fn run_analysis_bundle_with_q(
         }
     }
     let mut fp = promoted;
-    fp.sort_by(|a, b| a.strategy_id.cmp(&b.strategy_id));
-    fp.dedup_by(|a, b| a.strategy_id == b.strategy_id);
+    fp.sort_by(|a, b| (&a.symbol, &a.strategy_id).cmp(&(&b.symbol, &b.strategy_id)));
+    fp.dedup_by(|a, b| a.symbol == b.symbol && a.strategy_id == b.strategy_id);
     AnalysisBundle {
         started,
         finished: Utc::now(),
@@ -1132,9 +1144,36 @@ pub fn run_analysis_bundle_with_q(
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromotedCandidate {
+    pub symbol: String,
+    pub strategy_id: String,
+    pub strategy_version: u32,
+    pub confidence: f64,
+    pub q_value: f64,
+    pub research_score: f64,
+    pub config_version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AllocatedCandidate {
+    pub candidate: PromotedCandidate,
+    pub capital: f64,
+    pub risk_budget: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AllocationCandidate {
+    pub symbol: String,
+    pub strategy_id: String,
+    pub score: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HiveManufacturingPolicy {
     pub total_capital: f64,
     pub max_bots: usize,
+    pub max_bots_per_symbol: usize,
+    pub max_symbol_capital_pct: f64,
     pub risk_fraction: f64,
     pub min_expiry_minutes: u32,
     pub max_expiry_minutes: u32,
@@ -1143,12 +1182,196 @@ impl Default for HiveManufacturingPolicy {
     fn default() -> Self {
         Self {
             total_capital: 0.0,
-            max_bots: 3,
+            max_bots: 20,
+            max_bots_per_symbol: 4,
+            max_symbol_capital_pct: 0.25,
             risk_fraction: 0.0,
             min_expiry_minutes: 180,
             max_expiry_minutes: u32::MAX,
         }
     }
+}
+
+pub fn collect_promoted_candidates(bundle: &AnalysisBundle) -> Vec<PromotedCandidate> {
+    let mut candidates = Vec::new();
+    for p in &bundle.promoted {
+        if !p.promoted {
+            continue;
+        }
+        let Some(sa) = bundle.symbols.iter().find(|s| s.symbol == p.symbol) else {
+            continue;
+        };
+        if let Some(e) = sa
+            .report
+            .evaluations
+            .iter()
+            .find(|e| e.strategy_id == p.strategy_id)
+        {
+            candidates.push(PromotedCandidate {
+                symbol: p.symbol.clone(),
+                strategy_id: p.strategy_id.clone(),
+                strategy_version: p.version,
+                confidence: e.confidence,
+                q_value: 0.0,
+                research_score: e.confidence,
+                config_version: sa.report.config_version.clone(),
+            });
+        } else if let Some(g) = &sa.report.generated_strategy {
+            if g.blueprint.id == p.strategy_id {
+                if let Some(v) = &g.validation {
+                    if v.accepted {
+                        candidates.push(PromotedCandidate {
+                            symbol: p.symbol.clone(),
+                            strategy_id: p.strategy_id.clone(),
+                            strategy_version: g.blueprint.version,
+                            confidence: g.blueprint.confidence,
+                            q_value: g.generated_from_q,
+                            research_score: g.blueprint.confidence,
+                            config_version: sa.report.config_version.clone(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    // Dedup by composite identity: (symbol, strategy_id, strategy_version)
+    candidates.sort_by(|a, b| {
+        (&a.symbol, &a.strategy_id, a.strategy_version).cmp(&(
+            &b.symbol,
+            &b.strategy_id,
+            b.strategy_version,
+        ))
+    });
+    candidates.dedup_by(|a, b| {
+        a.symbol == b.symbol
+            && a.strategy_id == b.strategy_id
+            && a.strategy_version == b.strategy_version
+    });
+    candidates
+}
+
+pub fn allocate_candidates(
+    candidates: &[PromotedCandidate],
+    policy: &HiveManufacturingPolicy,
+) -> Vec<AllocatedCandidate> {
+    if !policy.total_capital.is_finite()
+        || policy.total_capital <= 0.0
+        || policy.max_bots == 0
+        || !policy.risk_fraction.is_finite()
+        || policy.risk_fraction <= 0.0
+    {
+        return Vec::new();
+    }
+    let mut ranked = candidates
+        .iter()
+        .filter(|c| {
+            c.confidence.is_finite()
+                && c.confidence > 0.0
+                && !c.symbol.is_empty()
+                && !c.strategy_id.is_empty()
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    ranked.sort_by(|a, b| {
+        b.confidence
+            .partial_cmp(&a.confidence)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let max_bots_per_sym = policy.max_bots_per_symbol.max(1);
+    let max_sym_cap =
+        if policy.max_symbol_capital_pct.is_finite() && policy.max_symbol_capital_pct > 0.0 {
+            policy.total_capital * policy.max_symbol_capital_pct.clamp(0.01, 1.0)
+        } else {
+            policy.total_capital
+        };
+
+    let mut selected: Vec<PromotedCandidate> = Vec::new();
+    let mut symbol_bot_counts: HashMap<String, usize> = HashMap::new();
+
+    for candidate in ranked {
+        if selected.len() >= policy.max_bots {
+            break;
+        }
+        let count = symbol_bot_counts
+            .entry(candidate.symbol.clone())
+            .or_insert(0);
+        if *count >= max_bots_per_sym {
+            continue; // ranked spillover to next eligible distinct symbol
+        }
+        *count += 1;
+        selected.push(candidate);
+    }
+
+    if selected.is_empty() {
+        return Vec::new();
+    }
+
+    let denom = selected.iter().map(|c| c.confidence).sum::<f64>();
+    if denom <= 0.0 {
+        return Vec::new();
+    }
+
+    let mut allocations: Vec<AllocatedCandidate> = Vec::new();
+    let mut symbol_capital: HashMap<String, f64> = HashMap::new();
+
+    for candidate in selected {
+        let uncapped = policy.total_capital * candidate.confidence / denom;
+        let sym_used = symbol_capital
+            .entry(candidate.symbol.clone())
+            .or_insert(0.0);
+        let avail = (max_sym_cap - *sym_used).max(0.0);
+        let capital = uncapped.min(avail);
+        *sym_used += capital;
+        if capital > 0.0 {
+            let risk_budget = capital * policy.risk_fraction;
+            allocations.push(AllocatedCandidate {
+                candidate,
+                capital,
+                risk_budget,
+            });
+        }
+    }
+
+    allocations
+}
+
+pub fn portfolio_confidence_allocate(
+    total: f64,
+    candidates: &[AllocationCandidate],
+    policy: &HiveManufacturingPolicy,
+) -> Vec<(AllocationCandidate, f64)> {
+    let promoted = candidates
+        .iter()
+        .map(|c| PromotedCandidate {
+            symbol: c.symbol.clone(),
+            strategy_id: c.strategy_id.clone(),
+            strategy_version: 1,
+            confidence: c.score,
+            q_value: 0.0,
+            research_score: c.score,
+            config_version: "v1".into(),
+        })
+        .collect::<Vec<_>>();
+    let mut pol = policy.clone();
+    pol.total_capital = total;
+    if pol.risk_fraction <= 0.0 {
+        pol.risk_fraction = 0.05;
+    }
+    let allocated = allocate_candidates(&promoted, &pol);
+    allocated
+        .into_iter()
+        .map(|a| {
+            (
+                AllocationCandidate {
+                    symbol: a.candidate.symbol,
+                    strategy_id: a.candidate.strategy_id,
+                    score: a.candidate.confidence,
+                },
+                a.capital,
+            )
+        })
+        .collect()
 }
 
 pub fn confidence_allocate(
@@ -1183,77 +1406,16 @@ pub fn manufacture_promoted_bots(
     policy: &HiveManufacturingPolicy,
     now: DateTime<Utc>,
 ) -> Vec<BotCreationPlan> {
-    if policy.max_bots == 0
-        || !policy.total_capital.is_finite()
-        || policy.total_capital <= 0.0
-        || !policy.risk_fraction.is_finite()
-        || policy.risk_fraction <= 0.0
-    {
+    let candidates = collect_promoted_candidates(bundle);
+    if candidates.is_empty() {
         return Vec::new();
     }
-    let mut scores = Vec::new();
-    for p in &bundle.promoted {
-        if let Some(e) = bundle
-            .symbols
-            .iter()
-            .flat_map(|s| s.report.evaluations.iter())
-            .find(|e| e.strategy_id == p.strategy_id)
-        {
-            scores.push((p.strategy_id.clone(), e.confidence));
-        } else if let Some(g) = bundle
-            .symbols
-            .iter()
-            .filter_map(|s| s.report.generated_strategy.as_ref())
-            .find(|g| g.blueprint.id == p.strategy_id)
-        {
-            if let Some(v) = &g.validation {
-                if v.accepted {
-                    scores.push((p.strategy_id.clone(), g.blueprint.confidence));
-                }
-            }
-        }
-    }
-    if scores.is_empty() {
-        for sa in &bundle.symbols {
-            for e in &sa.report.evaluations {
-                if e.confidence > 0.0 {
-                    scores.push((e.strategy_id.clone(), e.confidence));
-                }
-            }
-        }
-    }
-    let allocations = confidence_allocate(policy.total_capital, &scores, policy.max_bots);
+    let allocated = allocate_candidates(&candidates, policy);
     let mut plans = Vec::new();
-    for (strategy_id, capital) in allocations {
-        let Some((symbol, bars)) = bundle.symbols.iter().find_map(|sa| {
-            let promoted_here = sa
-                .report
-                .promoted
-                .iter()
-                .any(|p| p.strategy_id == strategy_id)
-                || sa
-                    .report
-                    .generated_strategy
-                    .as_ref()
-                    .map(|g| {
-                        g.blueprint.id == strategy_id
-                            && g.validation.as_ref().map(|v| v.accepted).unwrap_or(false)
-                    })
-                    .unwrap_or(false)
-                || sa
-                    .report
-                    .evaluations
-                    .iter()
-                    .any(|e| e.strategy_id == strategy_id);
-            if promoted_here {
-                histories
-                    .get(&sa.symbol)
-                    .filter(|b| !b.is_empty())
-                    .map(|b| (sa.symbol.clone(), b))
-            } else {
-                None
-            }
-        }) else {
+    for alloc in allocated {
+        let symbol = alloc.candidate.symbol;
+        let strategy_id = alloc.candidate.strategy_id;
+        let Some(bars) = histories.get(&symbol).filter(|b| !b.is_empty()) else {
             continue;
         };
         let Some(chain) = chains.get(&symbol) else {
@@ -1292,31 +1454,33 @@ pub fn manufacture_promoted_bots(
         else {
             continue;
         };
-        let risk_budget = capital * policy.risk_fraction;
-        let Some(report) = bundle
-            .symbols
-            .iter()
-            .find(|x| x.symbol == symbol)
-            .map(|x| &x.report)
-        else {
-            continue;
-        };
         if let Ok(plan) = manufacture_bot_plan(&BotManufacturingRequest {
             strategy_id: &strategy_id,
-            strategy_version: 1,
-            config_version: &report.config_version,
+            strategy_version: alloc.candidate.strategy_version,
+            config_version: &alloc.candidate.config_version,
             underlying: &symbol,
             quote: &quote,
-            capital_budget: capital,
-            risk_budget,
+            capital_budget: alloc.capital,
+            risk_budget: alloc.risk_budget,
             now,
             generation_id: None,
             risk_pct: Some(policy.risk_fraction),
             rl_state: None,
             rl_action: None,
-            rl_confidence: None,
+            rl_confidence: if alloc.candidate.q_value > 0.0 {
+                Some(alloc.candidate.q_value)
+            } else {
+                None
+            },
         }) {
+            println!(
+                "BOT_MANUFACTURED bot_id={} underlying={} strategy_id={} confidence={:.2} capital={:.2}",
+                plan.bot_id, plan.underlying, plan.strategy_id, alloc.candidate.confidence, plan.capital_allocated
+            );
             plans.push(plan);
+        }
+        if plans.len() >= policy.max_bots {
+            break;
         }
     }
     plans
@@ -1586,6 +1750,7 @@ mod manufacturing_tests {
             finished: now,
             evaluations: Vec::new(),
             promoted: vec![PromotionRecord {
+                symbol: "SPY".into(),
                 strategy_id: "momentum".into(),
                 version: 1,
                 fingerprint: "f".into(),
@@ -1610,6 +1775,7 @@ mod manufacturing_tests {
                 report,
             }],
             promoted: vec![PromotionRecord {
+                symbol: "SPY".into(),
                 strategy_id: "momentum".into(),
                 version: 1,
                 fingerprint: "f".into(),
@@ -1670,6 +1836,7 @@ mod v16_history_contract_tests {
             .map(|i| format!("STRAT-{i:02}"))
             .collect::<Vec<_>>();
         let promoted = vec![PromotionRecord {
+            symbol: "SPY".into(),
             strategy_id: "STRAT-99".into(),
             version: 1,
             fingerprint: "x".into(),
