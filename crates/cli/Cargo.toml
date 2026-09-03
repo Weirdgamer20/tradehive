@@ -23,3 +23,6 @@ th-storage={path="../storage"}
 th-memory={path="../memory"}
 th-deployment={path="../deployment"}
 tokio={workspace=true, features=["rt-multi-thread", "macros"]}
+
+[dev-dependencies]
+th-market-data={path="../market-data", features=["test-utils"]}

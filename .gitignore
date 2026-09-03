@@ -23,3 +23,5 @@ CLEANUP_SUMMARY.txt
 setup_rust.ps1
 run_cargo.ps1
 scripts_check.sh
+demo.sqlite
+integration-tests

@@ -60,20 +60,6 @@ fn production_config() -> Result<RuntimeConfig, Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| "0.10".into())
         .parse()
         .map_err(|_| "TRADING_TAKE_PROFIT_PCT invalid")?;
-    if let Ok(v) = std::env::var("HIVE_CANDIDATE_UNIVERSE")
-        .or_else(|_| std::env::var("HIVE_MARKET_UNIVERSE"))
-        .or_else(|_| std::env::var("TRADING_UNIVERSE"))
-    {
-        let syms = v
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_uppercase)
-            .collect::<Vec<_>>();
-        if !syms.is_empty() {
-            cfg.candidate_universe = syms;
-        }
-    }
     cfg.validate()?;
     Ok(cfg)
 }
@@ -106,6 +92,8 @@ async fn run_autonomous(
     println!("HIVE_STARTED");
     println!("MODE={}", if is_live { "LIVE" } else { "PAPER" });
     println!("AUTONOMOUS=true");
+    println!("PRODUCTION_PROVIDER=ALPACA");
+    println!("UNIVERSE_SOURCE=ALPACA_SCREENER");
 
     let cfg = production_config()?;
     let symbols = if let Some(raw) = raw_symbols {

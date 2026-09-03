@@ -29,3 +29,4 @@ th-reconcile={path="../reconcile"}
 
 [dev-dependencies]
 async-trait.workspace=true
+th-market-data={path="../market-data", features=["test-utils"]}

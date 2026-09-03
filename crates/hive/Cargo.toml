@@ -19,4 +19,4 @@ th-memory={path="../memory"}
 th-storage={path="../storage"}
 
 [dev-dependencies]
-th-market-data={path="../market-data"}
+th-market-data={path="../market-data", features=["test-utils"]}

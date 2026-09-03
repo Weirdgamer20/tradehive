@@ -4,7 +4,7 @@ use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration as StdDuration;
-use th_domain::{Bar, CandleBuilder, Greeks, OptionChain, OptionQuote, OptionType};
+use th_domain::{Bar, CandleBuilder, Greeks, OptionChain, OptionQuote};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -513,7 +513,9 @@ pub fn aggregate_5m(symbol: &str, mut bars: Vec<Bar>) -> Result<Vec<Bar>, Market
     Ok(out)
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 pub fn synthetic_option_chain(underlying: &str, spot: f64, now: DateTime<Utc>) -> OptionChain {
+    use th_domain::OptionType;
     let expiry = now + chrono::Duration::minutes(240);
     let mut quotes = Vec::new();
     for i in -10..=10 {
@@ -554,7 +556,9 @@ pub fn synthetic_option_chain(underlying: &str, spot: f64, now: DateTime<Utc>) -
     }
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 pub struct SyntheticProvider;
+#[cfg(any(test, feature = "test-utils"))]
 #[async_trait]
 impl MarketDataProvider for SyntheticProvider {
     async fn most_actives(&self, _limit: usize) -> Result<Vec<String>, MarketDataError> {

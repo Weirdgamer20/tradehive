@@ -53,8 +53,8 @@ impl Default for RuntimeConfig {
             stop_loss_pct: 0.0,
             take_profit_pct: 0.0,
             bot_max_hold_minutes: 180,
-            candidate_universe: vec!["SPY".into(), "QQQ".into(), "IWM".into()],
-            max_universe_size: 2,
+            candidate_universe: Vec::new(),
+            max_universe_size: 10,
         }
     }
 }
@@ -64,6 +64,8 @@ impl RuntimeConfig {
         Self {
             stop_loss_pct: 0.05,
             take_profit_pct: 0.0,
+            candidate_universe: vec!["SPY".into()],
+            max_universe_size: 2,
             ..Self::default()
         }
     }
@@ -83,20 +85,6 @@ impl RuntimeConfig {
         if let Ok(v) = std::env::var("TRADING_TAKE_PROFIT_PCT") {
             if let Ok(p) = v.parse::<f64>() {
                 c.take_profit_pct = p;
-            }
-        }
-        if let Ok(v) = std::env::var("HIVE_CANDIDATE_UNIVERSE")
-            .or_else(|_| std::env::var("HIVE_MARKET_UNIVERSE"))
-            .or_else(|_| std::env::var("TRADING_UNIVERSE"))
-        {
-            let syms = v
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_uppercase)
-                .collect::<Vec<_>>();
-            if !syms.is_empty() {
-                c.candidate_universe = syms;
             }
         }
         if let Ok(v) = std::env::var("HIVE_MAX_UNIVERSE_SIZE") {
@@ -1541,36 +1529,20 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
         println!("UNIVERSE_DISCOVERY_STARTED discovery_limit={discovery_limit} universe_size={universe_size}");
 
         // Stage 1: Discover candidates from Alpaca most-actives screener.
-        // Falls back to HIVE_CANDIDATE_UNIVERSE env var if explicitly set (for testing/override).
-        let candidates: Vec<String> = if let Ok(override_syms) =
-            std::env::var("HIVE_CANDIDATE_UNIVERSE")
-                .or_else(|_| std::env::var("HIVE_MARKET_UNIVERSE"))
-                .or_else(|_| std::env::var("TRADING_UNIVERSE"))
-        {
-            let syms: Vec<String> = override_syms
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_uppercase)
-                .collect();
-            println!("UNIVERSE_OVERRIDE_ACTIVE symbols={syms:?}");
-            syms
-        } else {
-            match self.provider.most_actives(discovery_limit).await {
-                Ok(syms) if !syms.is_empty() => {
-                    println!("UNIVERSE_DISCOVERY_COMPLETED candidates={}", syms.len());
-                    syms
-                }
-                Ok(_) => {
-                    return Err(RuntimeError::Market(
-                        "most_actives returned empty list; failing closed".into(),
-                    ));
-                }
-                Err(e) => {
-                    return Err(RuntimeError::Market(format!(
-                        "UNIVERSE_DISCOVERY_FAILED: {e}; failing closed"
-                    )));
-                }
+        let candidates = match self.provider.most_actives(discovery_limit).await {
+            Ok(syms) if !syms.is_empty() => {
+                println!("UNIVERSE_DISCOVERY_COMPLETED candidates={}", syms.len());
+                syms
+            }
+            Ok(_) => {
+                return Err(RuntimeError::Market(
+                    "most_actives returned empty list; failing closed".into(),
+                ));
+            }
+            Err(e) => {
+                return Err(RuntimeError::Market(format!(
+                    "UNIVERSE_DISCOVERY_FAILED: {e}; failing closed"
+                )));
             }
         };
 
