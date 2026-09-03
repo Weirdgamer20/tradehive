@@ -25,3 +25,5 @@ run_cargo.ps1
 scripts_check.sh
 demo.sqlite
 integration-tests
+
+data/reinforcement_learning_history.json

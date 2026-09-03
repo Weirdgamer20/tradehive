@@ -20,6 +20,103 @@ pub struct StrategySpec {
     pub enabled: bool,
     pub description: String,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StrategyGenome {
+    pub strategy_id: String,
+    pub version: u32,
+    pub parent_id: Option<String>,
+    pub generation: u32,
+    pub mutation_type: String,
+    pub parameters: HashMap<String, f64>,
+    pub feature_weights: HashMap<String, f64>,
+    pub entry_threshold: f64,
+    pub exit_threshold: f64,
+    pub max_hold_bars: u32,
+    pub regime_eligibility: Vec<Regime>,
+}
+
+impl StrategyGenome {
+    pub fn new_root(strategy_id: &str, version: u32) -> Self {
+        let mut params = HashMap::new();
+        params.insert("fast_period".into(), 10.0);
+        params.insert("slow_period".into(), 30.0);
+        params.insert("volatility_scalar".into(), 1.0);
+
+        let mut weights = HashMap::new();
+        weights.insert("momentum".into(), 0.6);
+        weights.insert("trend".into(), 0.4);
+
+        Self {
+            strategy_id: strategy_id.into(),
+            version,
+            parent_id: None,
+            generation: 0,
+            mutation_type: "ROOT".into(),
+            parameters: params,
+            feature_weights: weights,
+            entry_threshold: 0.55,
+            exit_threshold: 0.20,
+            max_hold_bars: 36,
+            regime_eligibility: vec![Regime::TrendingBull, Regime::TrendingBear, Regime::Range],
+        }
+    }
+
+    pub fn mutate(&self, new_version: u32, mutation_type: &str, variance: f64) -> Self {
+        let mut new_params = self.parameters.clone();
+        for val in new_params.values_mut() {
+            *val = (*val * (1.0 + variance * 0.1)).max(1.0);
+        }
+
+        let mut new_weights = self.feature_weights.clone();
+        for val in new_weights.values_mut() {
+            *val = (*val * (1.0 + variance * 0.05)).clamp(0.01, 1.0);
+        }
+
+        Self {
+            strategy_id: format!("{}.{}", self.strategy_id, new_version),
+            version: new_version,
+            parent_id: Some(self.strategy_id.clone()),
+            generation: self.generation + 1,
+            mutation_type: mutation_type.into(),
+            parameters: new_params,
+            feature_weights: new_weights,
+            entry_threshold: (self.entry_threshold * (1.0 + variance * 0.05)).clamp(0.3, 0.9),
+            exit_threshold: (self.exit_threshold * (1.0 + variance * 0.05)).clamp(0.05, 0.5),
+            max_hold_bars: self.max_hold_bars,
+            regime_eligibility: self.regime_eligibility.clone(),
+        }
+    }
+
+    pub fn recombine(parent_a: &Self, parent_b: &Self, new_id: &str, new_version: u32) -> Self {
+        let mut params = HashMap::new();
+        for (k, v) in &parent_a.parameters {
+            let vb = parent_b.parameters.get(k).unwrap_or(v);
+            params.insert(k.clone(), (v + vb) / 2.0);
+        }
+
+        let mut weights = HashMap::new();
+        for (k, v) in &parent_a.feature_weights {
+            let vb = parent_b.feature_weights.get(k).unwrap_or(v);
+            weights.insert(k.clone(), (v + vb) / 2.0);
+        }
+
+        Self {
+            strategy_id: new_id.into(),
+            version: new_version,
+            parent_id: Some(format!("{}+{}", parent_a.strategy_id, parent_b.strategy_id)),
+            generation: parent_a.generation.max(parent_b.generation) + 1,
+            mutation_type: "RECOMBINATION".into(),
+            parameters: params,
+            feature_weights: weights,
+            entry_threshold: (parent_a.entry_threshold + parent_b.entry_threshold) / 2.0,
+            exit_threshold: (parent_a.exit_threshold + parent_b.exit_threshold) / 2.0,
+            max_hold_bars: (parent_a.max_hold_bars + parent_b.max_hold_bars) / 2,
+            regime_eligibility: parent_a.regime_eligibility.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StrategyAction {
     Long,
@@ -30,6 +127,9 @@ pub trait Strategy: Send {
     fn spec(&self) -> &StrategySpec;
     fn update(&mut self, bar: &Bar, state: &MarketState) -> Option<Signal>;
     fn reset(&mut self) {}
+    fn genome(&self) -> Option<StrategyGenome> {
+        None
+    }
 }
 
 fn sma(xs: &[f64], n: usize) -> Option<f64> {

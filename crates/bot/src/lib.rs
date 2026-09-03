@@ -3,10 +3,10 @@ use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use th_deployment::{BotCreationPlan, BotFleet};
-use th_domain::{Bar, OrderIntent, OrderSide, SessionPhase};
+use th_domain::{Bar, OrderIntent, OrderSide, OrderStatus, SessionPhase};
 use th_execution::{order_hash, reconcile_positions, Broker, ExecutionEngine};
 use th_hive::{
-    manufacture_promoted_bots, run_analysis_with_q_and_trades, AnalysisBundle,
+    manufacture_promoted_bots_for_session, run_analysis_with_q_and_trades, AnalysisBundle,
     HiveManufacturingPolicy, QLearning,
 };
 use th_market_data::{classify_news_risk, MarketDataProvider, MultiSymbolCandleEngine, NewsRisk};
@@ -367,7 +367,7 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
         let json_history = JsonHistoryStore::new(history_root)
             .map_err(|e| RuntimeError::Storage(e.to_string()))?;
         let now = Utc::now();
-        let daily_key = now.with_timezone(&cfg.tz()).date_naive().to_string();
+        let daily_key = now.date_naive().to_string();
         let daily_name = format!("daily_realized:{}", daily_key);
         let daily_realized = store
             .checkpoint_value(&daily_name)
@@ -409,27 +409,8 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                 bars.insert(symbol, history);
             }
         }
-        let bot_plans = store
-            .load_bot_plans()
-            .map_err(|e| RuntimeError::Storage(e.to_string()))?
-            .into_iter()
-            .map(|p| (p.bot_id.clone(), p))
-            .collect::<HashMap<_, _>>();
-        let mut fleet = BotFleet::default();
-        for p in bot_plans.values() {
-            if fleet
-                .create(
-                    &p.bot_id,
-                    &p.strategy_id,
-                    &p.config_version,
-                    p.capital_allocated,
-                )
-                .is_ok()
-            {
-                let _ = fleet.promote_paper(&p.bot_id);
-                let _ = fleet.activate(&p.bot_id);
-            }
-        }
+        let bot_plans = HashMap::new();
+        let fleet = BotFleet::default();
         for row in store
             .load_open_trades()
             .map_err(|e| RuntimeError::Storage(e.to_string()))?
@@ -452,12 +433,12 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                 );
             }
         }
+        let risk_limits =
+            RiskLimits::from_env().map_err(|e| RuntimeError::InvalidConfig(e.to_string()))?;
+        let execution = ExecutionEngine::new(broker, RiskGovernor::new(risk_limits));
         Ok(Self {
             strategies,
-            execution: ExecutionEngine::new(
-                broker,
-                RiskGovernor::new(RiskLimits::from_env().unwrap_or_default()),
-            ),
+            execution,
             provider,
             store,
             bars,
@@ -517,7 +498,7 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
         }
     }
     pub fn roll_daily_risk(&mut self, now: DateTime<Utc>) -> Result<(), RuntimeError> {
-        let key = now.with_timezone(&self.cfg.tz()).date_naive().to_string();
+        let key = now.date_naive().to_string();
         if key != self.daily_key {
             self.daily_key = key.clone();
             self.daily_realized = 0.0;
@@ -600,41 +581,73 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
             && q_action.as_deref() != Some("Exit")
             && q_action.as_deref() != Some("Sell");
         let mut signals = Vec::new();
+        // Strategy-to-bot routing: evaluate only strategies assigned to active bots for this symbol
+        let assigned_strategies: Vec<String> = self
+            .bot_plans
+            .values()
+            .filter(|p| {
+                let session_match = match (&self.current_session_id, &p.session_id) {
+                    (Some(curr), plan_sid) if !plan_sid.is_empty() => curr == plan_sid,
+                    _ => true,
+                };
+                session_match && p.underlying == candle.symbol
+            })
+            .map(|p| p.strategy_id.clone())
+            .collect();
+
         for strategy in self.strategies.iter_mut() {
-            if let Some(sig) = strategy.update(&candle, &state) {
-                // Gate long entries by Q-policy. Short/flat signals always pass through.
-                let is_long_entry = matches!(
-                    sig.side,
-                    th_domain::SignalSide::LongCall | th_domain::SignalSide::LongPut
-                );
-                if is_long_entry && !q_permits_buy {
-                    println!(
-                        "SIGNAL_SUPPRESSED_BY_Q symbol={} strategy_id={} side={:?} q_action={:?}",
-                        sig.symbol, sig.strategy_id, sig.side, q_action
+            if assigned_strategies.contains(&strategy.spec().id) {
+                if let Some(sig) = strategy.update(&candle, &state) {
+                    // Gate long entries by Q-policy. Short/flat signals always pass through.
+                    let is_long_entry = matches!(
+                        sig.side,
+                        th_domain::SignalSide::LongCall | th_domain::SignalSide::LongPut
                     );
-                    continue;
+                    if is_long_entry && !q_permits_buy {
+                        println!(
+                            "SIGNAL_SUPPRESSED_BY_Q symbol={} strategy_id={} side={:?} q_action={:?}",
+                            sig.symbol, sig.strategy_id, sig.side, q_action
+                        );
+                        continue;
+                    }
+                    println!(
+                        "SIGNAL_GENERATED symbol={} strategy_id={} side={:?} strength={:.2} q_action={:?}",
+                        sig.symbol, sig.strategy_id, sig.side, sig.strength, q_action
+                    );
+                    signals.push(sig);
                 }
-                println!(
-                    "SIGNAL_GENERATED symbol={} strategy_id={} side={:?} strength={:.2} q_action={:?}",
-                    sig.symbol, sig.strategy_id, sig.side, sig.strength, q_action
-                );
-                signals.push(sig)
             }
         }
         for sig in signals {
+            let sig_symbol = sig.symbol.clone();
+            let sig_strat = sig.strategy_id.clone();
             self.store
                 .signal(&sig)
                 .map_err(|e| RuntimeError::Storage(e.to_string()))?;
             if let Err(e) = self.handle_signal(sig).await {
-                if !matches!(e, RuntimeError::NoOption | RuntimeError::NewsRisk) {
-                    self.stats.rejected_orders += 1;
-                    self.store
-                        .event(
-                            "ORDER_REJECTED",
-                            &serde_json::json!({"error":e.to_string()}),
-                        )
-                        .map_err(|x| RuntimeError::Storage(x.to_string()))?;
-                }
+                self.stats.rejected_orders += 1;
+                let reason = match &e {
+                    RuntimeError::NoOption => "NO_OPTION".to_string(),
+                    RuntimeError::NewsRisk => "NEWS_RISK".to_string(),
+                    RuntimeError::Market(msg) => format!("MARKET_{msg}"),
+                    RuntimeError::Execution(msg) => format!("EXECUTION_{msg}"),
+                    _ => e.to_string(),
+                };
+                println!(
+                    "SIGNAL_REJECTED symbol={} strategy_id={} reason={}",
+                    sig_symbol, sig_strat, reason
+                );
+                self.store
+                    .event(
+                        "SIGNAL_REJECTED",
+                        &serde_json::json!({
+                            "symbol": sig_symbol,
+                            "strategy_id": sig_strat,
+                            "reason": reason,
+                            "error": e.to_string(),
+                        }),
+                    )
+                    .map_err(|x| RuntimeError::Storage(x.to_string()))?;
             }
         }
         Ok(())
@@ -851,6 +864,15 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                         } else {
                             "time_limit".into()
                         },
+                        signal_price: Some(t.entry_price),
+                        quote_spread_bps: None,
+                        entry_fill_price: Some(t.entry_price),
+                        exit_fill_price: Some(fp),
+                        slippage_bps: Some(
+                            ((fp - mark).abs() / mark.max(1e-9) * 10000.0).clamp(0.0, 1000.0),
+                        ),
+                        latency_ms: Some(10),
+                        regime_at_entry: None,
                     };
                     // Online Q-table update: immediately reflect this trade outcome.
                     if let Some(q) = self.q_policy.as_mut() {
@@ -924,7 +946,13 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
         let plan = self
             .bot_plans
             .values()
-            .find(|p| p.strategy_id == sig.strategy_id && p.underlying == sig.symbol)
+            .find(|p| {
+                let session_match = match (&self.current_session_id, &p.session_id) {
+                    (Some(curr), plan_sid) if !plan_sid.is_empty() => curr == plan_sid,
+                    _ => true,
+                };
+                session_match && p.strategy_id == sig.strategy_id && p.underlying == sig.symbol
+            })
             .cloned()
             .ok_or(RuntimeError::NoOption)?;
         let chain = self
@@ -1004,7 +1032,9 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
         let sl_pct = if self.cfg.stop_loss_pct > 0.0 {
             self.cfg.stop_loss_pct
         } else {
-            0.05
+            return Err(RuntimeError::InvalidConfig(
+                "stop_loss_pct must be strictly positive".into(),
+            ));
         };
         let positions = self
             .execution
@@ -1049,14 +1079,8 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                 capital_allocated: plan.capital_allocated,
                 risk_budget: plan.risk_budget,
             });
-        let max_trade_risk_pct = std::env::var("RISK_MAX_TRADE_RISK_PCT")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(0.02);
-        let max_portfolio_risk_pct = std::env::var("RISK_MAX_PORTFOLIO_RISK_PCT")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(0.10);
+        let max_trade_risk_pct = self.execution.risk().limits().max_trade_risk_pct;
+        let max_portfolio_risk_pct = self.execution.risk().limits().max_portfolio_risk_pct;
         let ceiling_action = CeilingAction::from_env();
 
         let sizing_inputs = DynamicSizingInputs {
@@ -1330,6 +1354,40 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                 opened_at: t.entry_ts,
             })
             .collect::<Vec<_>>();
+        // Crash-consistent in-flight order reconciliation
+        if let Ok(reserved) = self.store.load_reserved_orders() {
+            for cid in reserved {
+                match self
+                    .execution
+                    .broker_ref()
+                    .find_by_client_order_id(cid)
+                    .await
+                {
+                    Ok(Some(bo)) => {
+                        let _ = self.store.set_idempotency(
+                            cid,
+                            &bo.broker_order_id,
+                            &format!("{:?}", bo.status),
+                        );
+                        println!(
+                            "ORDER_RECONCILED client_order_id={} broker_id={} status={:?}",
+                            cid, bo.broker_order_id, bo.status
+                        );
+                    }
+                    Ok(None) => {
+                        let _ = self.store.set_idempotency(cid, "", "FAILED");
+                        println!("ORDER_RECONCILED_FAILED client_order_id={}", cid);
+                    }
+                    Err(e) => {
+                        println!(
+                            "ORDER_RECONCILIATION_ERROR client_order_id={} error={}",
+                            cid, e
+                        );
+                    }
+                }
+            }
+        }
+
         let report = reconcile_positions(&internal, &broker);
         self.store
             .event("RECONCILIATION", &report)
@@ -1368,17 +1426,19 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
             .parse::<f64>()
             .map_err(|_| RuntimeError::InvalidConfig("HIVE_TOTAL_CAPITAL invalid".into()))?;
         let max_bots = std::env::var("HIVE_MAX_BOTS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(20);
+            .map_err(|_| RuntimeError::InvalidConfig("HIVE_MAX_BOTS missing".into()))?
+            .parse::<usize>()
+            .map_err(|_| RuntimeError::InvalidConfig("HIVE_MAX_BOTS invalid".into()))?;
         let max_bots_per_symbol = std::env::var("HIVE_MAX_BOTS_PER_SYMBOL")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(4);
+            .map_err(|_| RuntimeError::InvalidConfig("HIVE_MAX_BOTS_PER_SYMBOL missing".into()))?
+            .parse::<usize>()
+            .map_err(|_| RuntimeError::InvalidConfig("HIVE_MAX_BOTS_PER_SYMBOL invalid".into()))?;
         let max_symbol_capital_pct = std::env::var("HIVE_MAX_SYMBOL_CAPITAL_PCT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0.25);
+            .map_err(|_| RuntimeError::InvalidConfig("HIVE_MAX_SYMBOL_CAPITAL_PCT missing".into()))?
+            .parse::<f64>()
+            .map_err(|_| {
+                RuntimeError::InvalidConfig("HIVE_MAX_SYMBOL_CAPITAL_PCT invalid".into())
+            })?;
         let risk_fraction = std::env::var("HIVE_RISK_FRACTION")
             .map_err(|_| RuntimeError::InvalidConfig("HIVE_RISK_FRACTION missing".into()))?
             .parse::<f64>()
@@ -1591,20 +1651,35 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
     ) -> Result<usize, RuntimeError> {
         let now = Utc::now();
         if !self.bot_plans.is_empty() {
-            println!("HIVE_INITIALIZED bots={}", self.bot_plans.len());
-            let seed_ids = th_strategy::StrategyRegistry::new().seed_ids();
-            println!("SEED_LIBRARY_LOADED count={}", seed_ids.len());
-            for plan in self.bot_plans.values() {
-                println!(
-                    "BOT_STARTED bot_id={} strategy_id={} underlying={} capital={} risk_budget={}",
-                    plan.bot_id,
-                    plan.strategy_id,
-                    plan.underlying,
-                    plan.capital_allocated,
-                    plan.risk_budget
-                );
+            let session_valid = self.current_session_id.as_deref().is_none_or(|sid| {
+                self.bot_plans
+                    .values()
+                    .all(|p| p.session_id.is_empty() || p.session_id == sid)
+            });
+            let universe_valid = symbols.is_empty()
+                || self
+                    .bot_plans
+                    .values()
+                    .any(|p| symbols.contains(&p.underlying));
+            if session_valid && universe_valid {
+                println!("HIVE_INITIALIZED bots={}", self.bot_plans.len());
+                let seed_ids = th_strategy::StrategyRegistry::new().seed_ids();
+                println!("SEED_LIBRARY_LOADED count={}", seed_ids.len());
+                for plan in self.bot_plans.values() {
+                    println!(
+                        "BOT_STARTED bot_id={} strategy_id={} underlying={} capital={} risk_budget={}",
+                        plan.bot_id,
+                        plan.strategy_id,
+                        plan.underlying,
+                        plan.capital_allocated,
+                        plan.risk_budget
+                    );
+                }
+                return Ok(self.bot_plans.len());
+            } else {
+                self.fleet.retire_all();
+                self.bot_plans.clear();
             }
-            return Ok(self.bot_plans.len());
         }
 
         println!("HIVE_INITIALIZED status=manufacturing_initial_bots");
@@ -1680,19 +1755,17 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
             chains.insert(symbol.clone(), chain);
         }
 
-        let expiry_policy = th_domain::OptionExpiryPolicy::from_env();
-        let policy =
-            Self::manufacturing_policy_from_env().unwrap_or(th_hive::HiveManufacturingPolicy {
-                total_capital: 1000000.0,
-                max_bots: 20,
-                max_bots_per_symbol: 4,
-                max_symbol_capital_pct: 0.25,
-                risk_fraction: 0.05,
-                min_expiry_minutes: expiry_policy.min_expiry_minutes,
-                max_expiry_minutes: expiry_policy.max_expiry_minutes.unwrap_or(u32::MAX),
-            });
+        let policy = Self::manufacturing_policy_from_env()?;
 
-        let plans = manufacture_promoted_bots(&bundle, &histories, &chains, &policy, now);
+        let mfg_now = Utc::now();
+        let plans = th_hive::manufacture_promoted_bots_for_session(
+            &bundle,
+            &histories,
+            &chains,
+            &policy,
+            mfg_now,
+            self.current_session_id.as_deref(),
+        );
         for plan in &plans {
             self.store
                 .save_bot_plan(plan)
@@ -1815,12 +1888,15 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                 chains.insert(symbol.clone(), chain);
             }
         }
-        let plans = manufacture_promoted_bots(
+        let policy = Self::manufacturing_policy_from_env()?;
+        let mfg_now = Utc::now();
+        let plans = manufacture_promoted_bots_for_session(
             &bundle,
             &histories,
             &chains,
-            &Self::manufacturing_policy_from_env()?,
-            now,
+            &policy,
+            mfg_now,
+            self.current_session_id.as_deref(),
         );
         for plan in &plans {
             self.store
@@ -1895,7 +1971,13 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
         symbols: &[String],
         now: DateTime<Utc>,
     ) -> Result<Vec<String>, RuntimeError> {
+        self.current_session_id = Some(session_id.to_string());
         println!("PRE_MARKET_ANALYSIS_STARTED session_id={session_id}");
+
+        // Reconcile broker positions and retire previous session bots before manufacturing
+        let _ = self.reconcile().await;
+        self.fleet.retire_all();
+        self.bot_plans.clear();
 
         let prior_rl = self.json_history.latest_rl_session().unwrap_or(None);
 
@@ -1953,6 +2035,7 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
     }
 
     pub async fn activate_market_open(&mut self, session_id: &str) -> Result<(), RuntimeError> {
+        self.current_session_id = Some(session_id.to_string());
         if !self.reconcile().await? {
             println!("SESSION_ERROR reconciliation failed at market open");
             return Err(RuntimeError::ReconciliationFailed);
@@ -1985,45 +2068,216 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
             let Some(t) = self.open_trades.get(&key).cloned() else {
                 continue;
             };
-            // Get current mark price from option chain; fall back to entry price if unavailable.
-            let mark =
-                if let Ok(chain) = self.provider.option_chain(&t.underlying, Utc::now()).await {
-                    chain
-                        .quotes
-                        .iter()
-                        .find(|q| q.symbol == t.symbol)
-                        .map(|q| q.bid)
-                        .unwrap_or(t.entry_price)
-                } else {
-                    t.entry_price
-                };
-            let pnl = (mark - t.entry_price) * t.qty as f64 * th_domain::CONTRACT_MULTIPLIER;
-            let trade = TradeRecord {
-                trade_id: format!("TRADE-EOD-{}-{}", session_id, t.symbol),
-                symbol: t.underlying.clone(),
-                strategy_id: t.strategy_id.clone(),
-                session_id: session_id.to_string(),
-                entry: t.entry_ts,
-                exit: Some(Utc::now()),
-                pnl,
-                fees: 0.0,
-                reason: "session_end".into(),
+            let chain = self
+                .provider
+                .option_chain(&t.underlying, Utc::now())
+                .await
+                .map_err(|e| RuntimeError::Market(e.to_string()))?;
+            let quote = chain
+                .quotes
+                .iter()
+                .find(|q| {
+                    q.symbol == t.symbol && q.is_tradeable(Utc::now(), self.cfg.max_quote_age_secs)
+                })
+                .ok_or_else(|| {
+                    RuntimeError::Market(format!(
+                        "cannot flatten {}: no fresh executable quote",
+                        t.symbol
+                    ))
+                })?;
+            let mark = quote.bid;
+            let spread = quote.spread_bps();
+
+            let broker_positions = self
+                .execution
+                .positions()
+                .await
+                .map_err(|e| RuntimeError::Execution(e.to_string()))?;
+            let acct = self
+                .execution
+                .broker()
+                .await
+                .map_err(|e| RuntimeError::Execution(e.to_string()))?;
+            let portfolio = PortfolioRisk {
+                cash: acct.cash,
+                realized_today: self.daily_realized,
+                positions: broker_positions,
             };
-            self.experience.record_trade(trade.clone());
-            let autopsy = self.experience.autopsy(&trade);
-            let _ = self.store.event_keyed(
-                &format!("TRADE_AUTOPSY:{}", trade.trade_id),
-                "TRADE_AUTOPSY",
-                &serde_json::json!({"trade": trade, "autopsy": autopsy}),
+            let mut order = OrderIntent {
+                client_order_id: Uuid::new_v4(),
+                symbol: t.symbol.clone(),
+                side: OrderSide::Sell,
+                qty: t.qty,
+                limit_price: Some(mark),
+                reduce_only: true,
+                strategy_id: t.strategy_id.clone(),
+                created_at: Utc::now(),
+                order_hash: String::new(),
+            };
+            order.order_hash = order_hash(&order);
+
+            if let Some((broker_id, status)) = self
+                .store
+                .idempotency_status(order.client_order_id)
+                .map_err(|e| RuntimeError::Storage(e.to_string()))?
+            {
+                if broker_id.is_some() && status != "FAILED" {
+                    continue;
+                }
+            } else if !self
+                .store
+                .reserve_order(&order)
+                .map_err(|e| RuntimeError::Storage(e.to_string()))?
+            {
+                continue;
+            }
+
+            let (bo, _) = self
+                .execution
+                .execute(order.clone(), mark, spread, &portfolio)
+                .await
+                .map_err(|e| RuntimeError::Execution(e.to_string()))?;
+
+            let _ = self.store.set_idempotency(
+                order.client_order_id,
+                &bo.broker_order_id,
+                &format!("{:?}", bo.status),
             );
-            self.stats.trades_closed += 1;
-            self.stats.realized_pnl += pnl;
-            self.open_trades.remove(&key);
-            let _ = self.store.delete_open_trade(&key);
-            println!(
-                "POSITION_FORCE_CLOSED symbol={} underlying={} pnl={:.2} reason=session_end",
-                t.symbol, t.underlying, pnl
-            );
+
+            match bo.status {
+                OrderStatus::Filled => {
+                    let fp = bo.filled_avg_price.unwrap_or(mark);
+                    let pnl = (fp - t.entry_price)
+                        * bo.filled_qty as f64
+                        * th_domain::CONTRACT_MULTIPLIER;
+                    self.daily_realized += pnl;
+                    let _ = self.store.checkpoint(
+                        &format!("daily_realized:{}", self.daily_key),
+                        &self.daily_realized.to_string(),
+                    );
+                    self.stats.realized_pnl += pnl;
+                    self.stats.trades_closed += 1;
+                    let fill = th_domain::Fill {
+                        fill_id: Uuid::new_v4(),
+                        client_order_id: order.client_order_id,
+                        broker_order_id: bo.broker_order_id.clone(),
+                        symbol: order.symbol.clone(),
+                        side: order.side,
+                        qty: bo.filled_qty,
+                        price: fp,
+                        fee: 0.0,
+                        ts: Utc::now(),
+                    };
+                    let _ = self.store.fill(&fill);
+                    let trade = TradeRecord {
+                        trade_id: format!("TRADE-EOD-{}-{}", session_id, t.symbol),
+                        symbol: t.underlying.clone(),
+                        strategy_id: t.strategy_id.clone(),
+                        session_id: session_id.to_string(),
+                        entry: t.entry_ts,
+                        exit: Some(Utc::now()),
+                        pnl,
+                        fees: 0.0,
+                        reason: "session_end".into(),
+                        signal_price: Some(t.entry_price),
+                        quote_spread_bps: None,
+                        entry_fill_price: Some(t.entry_price),
+                        exit_fill_price: Some(fp),
+                        slippage_bps: Some(0.0),
+                        latency_ms: Some(10),
+                        regime_at_entry: None,
+                    };
+                    self.experience.record_trade(trade.clone());
+                    let autopsy = self.experience.autopsy(&trade);
+                    let _ = self.store.event_keyed(
+                        &format!("TRADE_AUTOPSY:{}", trade.trade_id),
+                        "TRADE_AUTOPSY",
+                        &serde_json::json!({"trade": trade, "autopsy": autopsy}),
+                    );
+                    self.open_trades.remove(&key);
+                    let _ = self.store.delete_open_trade(&key);
+                    println!(
+                        "POSITION_FORCE_CLOSED symbol={} underlying={} filled_qty={} pnl={:.2} reason=session_end",
+                        t.symbol, t.underlying, bo.filled_qty, pnl
+                    );
+                }
+                OrderStatus::PartiallyFilled => {
+                    let fp = bo.filled_avg_price.unwrap_or(mark);
+                    let pnl = (fp - t.entry_price)
+                        * bo.filled_qty as f64
+                        * th_domain::CONTRACT_MULTIPLIER;
+                    self.daily_realized += pnl;
+                    let _ = self.store.checkpoint(
+                        &format!("daily_realized:{}", self.daily_key),
+                        &self.daily_realized.to_string(),
+                    );
+                    self.stats.realized_pnl += pnl;
+                    let fill = th_domain::Fill {
+                        fill_id: Uuid::new_v4(),
+                        client_order_id: order.client_order_id,
+                        broker_order_id: bo.broker_order_id.clone(),
+                        symbol: order.symbol.clone(),
+                        side: order.side,
+                        qty: bo.filled_qty,
+                        price: fp,
+                        fee: 0.0,
+                        ts: Utc::now(),
+                    };
+                    let _ = self.store.fill(&fill);
+                    let mut remaining = t.clone();
+                    remaining.qty = remaining.qty.saturating_sub(bo.filled_qty);
+                    self.open_trades.insert(key.clone(), remaining.clone());
+                    let _ = self.store.open_trade(&OpenTradeRecord {
+                        symbol: remaining.symbol.clone(),
+                        underlying: remaining.underlying.clone(),
+                        strategy_id: remaining.strategy_id.clone(),
+                        entry_price: remaining.entry_price,
+                        entry_ts: remaining.entry_ts.to_rfc3339(),
+                        stop_loss_pct: remaining.stop_loss_pct,
+                        take_profit_pct: remaining.take_profit_pct,
+                        qty: remaining.qty,
+                    });
+                    println!(
+                        "POSITION_PARTIALLY_CLOSED symbol={} underlying={} filled_qty={} remaining_qty={} pnl={:.2}",
+                        t.symbol, t.underlying, bo.filled_qty, remaining.qty, pnl
+                    );
+                }
+                OrderStatus::New | OrderStatus::Accepted => {
+                    println!(
+                        "POSITION_CLOSE_PENDING symbol={} underlying={} status={:?}",
+                        t.symbol, t.underlying, bo.status
+                    );
+                }
+                OrderStatus::Cancelled | OrderStatus::Rejected => {
+                    println!(
+                        "POSITION_CLOSE_REJECTED symbol={} underlying={} status={:?}",
+                        t.symbol, t.underlying, bo.status
+                    );
+                    self.active = false;
+                    self.health = RuntimeHealth::Degraded;
+                    self.execution.risk_mut().engage_kill_switch();
+                }
+            }
+        }
+
+        // Mandatory EOD reconciliation
+        if !self.reconcile().await? {
+            self.active = false;
+            self.health = RuntimeHealth::Degraded;
+            self.execution.risk_mut().engage_kill_switch();
+            return Err(RuntimeError::ReconciliationFailed);
+        }
+
+        let broker_positions = self
+            .execution
+            .positions()
+            .await
+            .map_err(|e| RuntimeError::Execution(e.to_string()))?;
+        if !self.open_trades.is_empty() || !broker_positions.is_empty() {
+            self.active = false;
+            self.health = RuntimeHealth::Degraded;
+            self.execution.risk_mut().engage_kill_switch();
+            return Err(RuntimeError::ReconciliationFailed);
         }
 
         println!("POSITIONS_FLATTENED session_id={session_id}");

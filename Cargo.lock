@@ -1263,6 +1263,7 @@ dependencies = [
  "th-reconcile",
  "th-research",
  "th-risk",
+ "th-sentinel",
  "th-state",
  "th-storage",
  "th-strategy",
@@ -1426,6 +1427,7 @@ version = "0.9.0"
 dependencies = [
  "chrono",
  "serde",
+ "th-domain",
  "thiserror",
 ]
 

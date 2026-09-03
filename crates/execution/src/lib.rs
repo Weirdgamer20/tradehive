@@ -614,6 +614,9 @@ impl<B: Broker> ExecutionEngine<B> {
             seen: std::collections::HashSet::new(),
         }
     }
+    pub fn broker_ref(&self) -> &B {
+        &self.broker
+    }
     pub fn risk(&self) -> &RiskGovernor {
         &self.risk
     }

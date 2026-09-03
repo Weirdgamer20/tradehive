@@ -24,8 +24,6 @@ enum Commands {
     },
     Run {
         #[arg(long)]
-        symbols: Option<String>,
-        #[arg(long)]
         max_ticks: Option<usize>,
     },
 }
@@ -33,9 +31,6 @@ enum Commands {
 #[tokio::main]
 async fn main() {
     dotenvy::dotenv().ok();
-    dotenvy::from_filename(".env").ok();
-    dotenvy::from_filename("config/.env").ok();
-    dotenvy::from_filename("config/example.env").ok();
     if let Err(e) = run().await {
         eprintln!("ERROR: {e}");
         std::process::exit(1);
@@ -47,43 +42,16 @@ fn require_env(var: &str) -> Result<String, Box<dyn std::error::Error>> {
 }
 
 fn production_config() -> Result<RuntimeConfig, Box<dyn std::error::Error>> {
-    let mut cfg = RuntimeConfig {
-        market_timezone: std::env::var("MARKET_TIMEZONE")
-            .unwrap_or_else(|_| "America/New_York".into()),
-        ..Default::default()
-    };
-    if let Ok(v) = std::env::var("TRADING_HIVE_DB") {
-        cfg.database_path = v;
+    let cfg = RuntimeConfig::from_env()?;
+
+    if cfg.stop_loss_pct <= 0.0 {
+        return Err("TRADING_STOP_LOSS_PCT must be > 0".into());
     }
-    cfg.stop_loss_pct = std::env::var("TRADING_STOP_LOSS_PCT")
-        .unwrap_or_else(|_| "0.05".into())
-        .parse()
-        .map_err(|_| "TRADING_STOP_LOSS_PCT invalid")?;
-    cfg.take_profit_pct = std::env::var("TRADING_TAKE_PROFIT_PCT")
-        .unwrap_or_else(|_| "0.10".into())
-        .parse()
-        .map_err(|_| "TRADING_TAKE_PROFIT_PCT invalid")?;
-    cfg.validate()?;
+
     Ok(cfg)
 }
 
-fn symbols(value: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    let out = value
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_uppercase)
-        .collect::<Vec<_>>();
-    if out.is_empty() {
-        return Err("no symbols configured".into());
-    }
-    Ok(out)
-}
-
-async fn run_autonomous(
-    raw_symbols: Option<String>,
-    max_ticks: Option<usize>,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_autonomous(max_ticks: Option<usize>) -> Result<(), Box<dyn std::error::Error>> {
     let key = require_env("APCA_API_KEY_ID")?;
     let secret = require_env("APCA_API_SECRET_KEY")?;
     let data_url = require_env("ALPACA_DATA_URL")?;
@@ -99,11 +67,6 @@ async fn run_autonomous(
     println!("UNIVERSE_SOURCE=ALPACA_SCREENER");
 
     let cfg = production_config()?;
-    let symbols = if let Some(raw) = raw_symbols {
-        symbols(&raw)?
-    } else {
-        Vec::new()
-    };
 
     let md = AlpacaConfig {
         key: key.clone(),
@@ -121,10 +84,10 @@ async fn run_autonomous(
     let mut runtime = TradingRuntime::new(cfg, broker, provider)?;
     match max_ticks {
         Some(n) => {
-            runtime.run_session(&symbols, Some(n)).await?;
+            runtime.run_session(&[], Some(n)).await?;
         }
         None => {
-            runtime.run_forever(&symbols).await?;
+            runtime.run_forever(&[]).await?;
         }
     }
     Ok(())
@@ -156,13 +119,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!("LIVE_DATA_OK symbol={symbol} bars={}", bars.len());
             Ok(())
         }
-        Some(Commands::Run {
-            symbols: raw_symbols,
-            max_ticks,
-        }) => run_autonomous(raw_symbols, max_ticks).await,
+        Some(Commands::Run { max_ticks }) => run_autonomous(max_ticks).await,
         None => {
             // Default: running without subcommands starts 24/7 autonomous production runtime
-            run_autonomous(None, None).await
+            run_autonomous(None).await
         }
     }
 }

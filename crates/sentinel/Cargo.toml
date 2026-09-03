@@ -7,3 +7,5 @@ license.workspace=true
 chrono.workspace=true
 serde.workspace=true
 thiserror.workspace=true
+th-domain = { path = "../domain" }
+

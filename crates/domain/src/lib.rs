@@ -407,6 +407,118 @@ impl SessionPhase {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AuthorizationClass {
+    ReadOnly,
+    Research,
+    Simulation,
+    PaperExecution,
+    LiveExecution,
+    ImprovementProposal,
+    ImprovementValidation,
+    PromotionAuthorized,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GovernancePolicy {
+    pub max_live_capital: f64,
+    pub allow_live_execution: bool,
+    pub allow_self_improvement: bool,
+    pub max_daily_drawdown_limit: f64,
+    pub require_red_team_approval: bool,
+    pub active_authorizations: Vec<AuthorizationClass>,
+}
+
+impl Default for GovernancePolicy {
+    fn default() -> Self {
+        Self {
+            max_live_capital: 0.0,
+            allow_live_execution: false,
+            allow_self_improvement: true,
+            max_daily_drawdown_limit: 0.05,
+            require_red_team_approval: true,
+            active_authorizations: vec![
+                AuthorizationClass::ReadOnly,
+                AuthorizationClass::Research,
+                AuthorizationClass::Simulation,
+                AuthorizationClass::PaperExecution,
+                AuthorizationClass::ImprovementProposal,
+                AuthorizationClass::ImprovementValidation,
+            ],
+        }
+    }
+}
+
+impl GovernancePolicy {
+    pub fn is_authorized(&self, auth: AuthorizationClass) -> bool {
+        self.active_authorizations.contains(&auth)
+    }
+
+    pub fn validate_execution_mode(&self, live: bool) -> Result<(), DomainError> {
+        if live
+            && (!self.allow_live_execution
+                || !self.is_authorized(AuthorizationClass::LiveExecution))
+        {
+            return Err(DomainError::Invalid(
+                "GOVERNANCE_BLOCKED: Live execution not authorized".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HiveState {
+    Starting,
+    PreMarket,
+    Researching,
+    Evaluating,
+    Manufacturing,
+    Ready,
+    MarketOpen,
+    Trading,
+    Halting,
+    MarketClosing,
+    Reconciling,
+    PostMarket,
+    Learning,
+    Improvement,
+    Finalized,
+    Degraded,
+    Halted,
+}
+
+impl HiveState {
+    pub fn is_operational(&self) -> bool {
+        !matches!(self, Self::Degraded | Self::Halted)
+    }
+
+    pub fn can_trade(&self) -> bool {
+        matches!(self, Self::Trading | Self::MarketOpen)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DataQualityStatus {
+    Valid,
+    Stale,
+    Duplicate,
+    Anomaly,
+    MissingField,
+    FutureTimestamp,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DataProvenance {
+    pub source: String,
+    pub feed: String,
+    pub request_ts: DateTime<Utc>,
+    pub market_ts: DateTime<Utc>,
+    pub symbol: String,
+    pub quality: DataQualityStatus,
+    pub latency_ms: i64,
+}
+
 #[derive(Debug, Error)]
 pub enum DomainError {
     #[error("invalid domain data: {0}")]

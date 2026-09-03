@@ -60,7 +60,7 @@ impl Store {
  CREATE TABLE IF NOT EXISTS experiments(id TEXT PRIMARY KEY,payload TEXT NOT NULL,decision TEXT,created_at TEXT NOT NULL);
  CREATE TABLE IF NOT EXISTS open_trades(symbol TEXT PRIMARY KEY,underlying TEXT NOT NULL,strategy_id TEXT NOT NULL,entry_price REAL NOT NULL,entry_ts TEXT NOT NULL,stop_loss_pct REAL NOT NULL,take_profit_pct REAL NOT NULL,qty INTEGER NOT NULL);
  CREATE TABLE IF NOT EXISTS event_keys(event_key TEXT PRIMARY KEY,created_at TEXT NOT NULL);
- CREATE TABLE IF NOT EXISTS bot_plans(plan_id TEXT PRIMARY KEY,bot_id TEXT NOT NULL,strategy_id TEXT NOT NULL,strategy_version INTEGER NOT NULL,config_version TEXT NOT NULL,underlying TEXT NOT NULL,option_symbol TEXT NOT NULL,option_type TEXT NOT NULL,strike REAL NOT NULL,expiry TEXT NOT NULL,capital_allocated REAL NOT NULL,risk_budget REAL NOT NULL DEFAULT 0,quantity INTEGER NOT NULL DEFAULT 0,entry_limit REAL NOT NULL DEFAULT 0,stop_loss_pct REAL NOT NULL DEFAULT 0,take_profit_pct REAL NOT NULL DEFAULT 0,min_expiry_minutes INTEGER NOT NULL DEFAULT 180,max_expiry_minutes INTEGER NOT NULL DEFAULT 0,allowed_direction TEXT NOT NULL DEFAULT 'Any',created_at TEXT NOT NULL,fingerprint TEXT NOT NULL UNIQUE);
+ CREATE TABLE IF NOT EXISTS bot_plans(plan_id TEXT PRIMARY KEY,bot_id TEXT NOT NULL,strategy_id TEXT NOT NULL,strategy_version INTEGER NOT NULL,config_version TEXT NOT NULL,underlying TEXT NOT NULL,option_symbol TEXT NOT NULL,option_type TEXT NOT NULL,strike REAL NOT NULL,expiry TEXT NOT NULL,capital_allocated REAL NOT NULL,risk_budget REAL NOT NULL DEFAULT 0,quantity INTEGER NOT NULL DEFAULT 0,entry_limit REAL NOT NULL DEFAULT 0,stop_loss_pct REAL NOT NULL DEFAULT 0,take_profit_pct REAL NOT NULL DEFAULT 0,min_expiry_minutes INTEGER NOT NULL DEFAULT 180,max_expiry_minutes INTEGER NOT NULL DEFAULT 0,allowed_direction TEXT NOT NULL DEFAULT 'Any',created_at TEXT NOT NULL,fingerprint TEXT NOT NULL UNIQUE,session_id TEXT NOT NULL DEFAULT '');
  CREATE TABLE IF NOT EXISTS hive_generations(generation_id TEXT PRIMARY KEY,created_at TEXT NOT NULL,status TEXT NOT NULL,total_capital REAL NOT NULL,bots_count INTEGER NOT NULL,metadata TEXT NOT NULL DEFAULT '{}');
  CREATE TABLE IF NOT EXISTS hive_bots(bot_id TEXT PRIMARY KEY,generation_id TEXT NOT NULL,strategy_id TEXT NOT NULL,strategy_name TEXT NOT NULL,underlying TEXT NOT NULL,option_symbol TEXT NOT NULL,option_type TEXT NOT NULL,strike REAL NOT NULL,expiry TEXT NOT NULL,capital_allocated REAL NOT NULL,risk_pct REAL NOT NULL,risk_budget REAL NOT NULL,max_capital_exposure REAL NOT NULL,position_size INTEGER NOT NULL DEFAULT 0,rl_state TEXT NOT NULL DEFAULT '{}',rl_action TEXT NOT NULL DEFAULT '{}',rl_confidence REAL NOT NULL DEFAULT 0.0,execution_status TEXT NOT NULL DEFAULT 'Created',created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
  CREATE TABLE IF NOT EXISTS strategy_risk_configs(strategy_id TEXT PRIMARY KEY,risk_pct REAL NOT NULL,capital_allocation REAL NOT NULL,risk_budget REAL NOT NULL,position_sizing_policy TEXT NOT NULL,created_at TEXT NOT NULL);
@@ -89,6 +89,10 @@ impl Store {
             (
                 "allowed_direction",
                 "ALTER TABLE bot_plans ADD COLUMN allowed_direction TEXT NOT NULL DEFAULT 'Any'",
+            ),
+            (
+                "session_id",
+                "ALTER TABLE bot_plans ADD COLUMN session_id TEXT NOT NULL DEFAULT ''",
             ),
         ] {
             let exists = self
@@ -278,6 +282,20 @@ impl Store {
         self.conn.execute("UPDATE idempotency SET broker_order_id=?,status=?,updated_at=? WHERE client_order_id=?",params![broker_id,status,Utc::now().to_rfc3339(),id.to_string()])?;
         Ok(())
     }
+    pub fn load_reserved_orders(&self) -> Result<Vec<Uuid>, StorageError> {
+        let mut st = self
+            .conn
+            .prepare("SELECT client_order_id FROM idempotency WHERE status='RESERVED'")?;
+        let rows = st.query_map([], |r| {
+            let s: String = r.get(0)?;
+            Uuid::parse_str(&s).map_err(|_| rusqlite::Error::InvalidQuery)
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
     pub fn save_config(
         &self,
         version: &str,
@@ -427,11 +445,11 @@ impl Store {
         Ok(out)
     }
     pub fn save_bot_plan(&self, p: &BotCreationPlan) -> Result<(), StorageError> {
-        self.conn.execute("INSERT OR REPLACE INTO bot_plans(plan_id,bot_id,strategy_id,strategy_version,config_version,underlying,option_symbol,option_type,strike,expiry,capital_allocated,risk_budget,quantity,entry_limit,stop_loss_pct,take_profit_pct,min_expiry_minutes,max_expiry_minutes,allowed_direction,created_at,fingerprint) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",params![p.plan_id,p.bot_id,p.strategy_id,p.strategy_version as i64,p.config_version,p.underlying,p.option_symbol,format!("{:?}",p.option_type),p.strike,p.expiry.to_rfc3339(),p.capital_allocated,p.risk_budget,p.quantity as i64,p.entry_limit,p.stop_loss_pct,p.take_profit_pct,p.min_expiry_minutes as i64,p.max_expiry_minutes as i64,"Any",p.created_at.to_rfc3339(),p.fingerprint])?;
+        self.conn.execute("INSERT OR REPLACE INTO bot_plans(plan_id,bot_id,strategy_id,strategy_version,config_version,underlying,option_symbol,option_type,strike,expiry,capital_allocated,risk_budget,quantity,entry_limit,stop_loss_pct,take_profit_pct,min_expiry_minutes,max_expiry_minutes,allowed_direction,created_at,fingerprint,session_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",params![p.plan_id,p.bot_id,p.strategy_id,p.strategy_version as i64,p.config_version,p.underlying,p.option_symbol,format!("{:?}",p.option_type),p.strike,p.expiry.to_rfc3339(),p.capital_allocated,p.risk_budget,p.quantity as i64,p.entry_limit,p.stop_loss_pct,p.take_profit_pct,p.min_expiry_minutes as i64,p.max_expiry_minutes as i64,"Any",p.created_at.to_rfc3339(),p.fingerprint,p.session_id])?;
         Ok(())
     }
     pub fn load_bot_plans(&self) -> Result<Vec<BotCreationPlan>, StorageError> {
-        let mut st=self.conn.prepare("SELECT plan_id,bot_id,strategy_id,strategy_version,config_version,underlying,option_symbol,option_type,strike,expiry,capital_allocated,risk_budget,quantity,entry_limit,stop_loss_pct,take_profit_pct,min_expiry_minutes,max_expiry_minutes,allowed_direction,created_at,fingerprint FROM bot_plans ORDER BY created_at")?;
+        let mut st=self.conn.prepare("SELECT plan_id,bot_id,strategy_id,strategy_version,config_version,underlying,option_symbol,option_type,strike,expiry,capital_allocated,risk_budget,quantity,entry_limit,stop_loss_pct,take_profit_pct,min_expiry_minutes,max_expiry_minutes,allowed_direction,created_at,fingerprint,session_id FROM bot_plans ORDER BY created_at")?;
         let rows = st.query_map([], |r| {
             let expiry: String = r.get(9)?;
             let created: String = r.get(19)?;
@@ -448,6 +466,7 @@ impl Store {
             };
             let capital_allocated: f64 = r.get(10)?;
             let risk_budget: f64 = r.get(11)?;
+            let session_id: String = r.get::<_, Option<String>>(21)?.unwrap_or_default();
             Ok(BotCreationPlan {
                 plan_id: r.get(0)?,
                 bot_id: r.get(1)?,
@@ -479,11 +498,74 @@ impl Store {
                 rl_state: None,
                 rl_action: None,
                 rl_confidence: 1.0,
+                session_id,
             })
         })?;
         let mut out = Vec::new();
         for row in rows {
-            out.push(row?)
+            out.push(row?);
+        }
+        Ok(out)
+    }
+    pub fn load_bot_plans_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<BotCreationPlan>, StorageError> {
+        let mut st = self.conn.prepare("SELECT plan_id,bot_id,strategy_id,strategy_version,config_version,underlying,option_symbol,option_type,strike,expiry,capital_allocated,risk_budget,quantity,entry_limit,stop_loss_pct,take_profit_pct,min_expiry_minutes,max_expiry_minutes,allowed_direction,created_at,fingerprint,session_id FROM bot_plans WHERE session_id=? ORDER BY created_at")?;
+        let rows = st.query_map(params![session_id], |r| {
+            let expiry: String = r.get(9)?;
+            let created: String = r.get(19)?;
+            let expiry = chrono::DateTime::parse_from_rfc3339(&expiry)
+                .map(|x| x.with_timezone(&Utc))
+                .map_err(|_| rusqlite::Error::InvalidQuery)?;
+            let created_at = chrono::DateTime::parse_from_rfc3339(&created)
+                .map(|x| x.with_timezone(&Utc))
+                .map_err(|_| rusqlite::Error::InvalidQuery)?;
+            let option_type = match r.get::<_, String>(7)?.as_str() {
+                "Call" => th_domain::OptionType::Call,
+                "Put" => th_domain::OptionType::Put,
+                _ => return Err(rusqlite::Error::InvalidQuery),
+            };
+            let capital_allocated: f64 = r.get(10)?;
+            let risk_budget: f64 = r.get(11)?;
+            let session_id: String = r.get::<_, Option<String>>(21)?.unwrap_or_default();
+            Ok(BotCreationPlan {
+                plan_id: r.get(0)?,
+                bot_id: r.get(1)?,
+                strategy_id: r.get(2)?,
+                strategy_version: r.get::<_, i64>(3)? as u32,
+                config_version: r.get(4)?,
+                underlying: r.get(5)?,
+                option_symbol: r.get(6)?,
+                option_type,
+                strike: r.get(8)?,
+                expiry,
+                capital_allocated,
+                risk_budget,
+                quantity: r.get::<_, i64>(12)? as u32,
+                entry_limit: r.get(13)?,
+                stop_loss_pct: r.get(14)?,
+                take_profit_pct: r.get(15)?,
+                min_expiry_minutes: r.get::<_, i64>(16)? as u32,
+                max_expiry_minutes: r.get::<_, i64>(17)? as u32,
+                created_at,
+                fingerprint: r.get(20)?,
+                generation_id: "GEN-DEFAULT".into(),
+                risk_pct: if capital_allocated > 0.0 {
+                    risk_budget / capital_allocated
+                } else {
+                    0.02
+                },
+                max_capital_exposure: capital_allocated,
+                rl_state: None,
+                rl_action: None,
+                rl_confidence: 1.0,
+                session_id,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
         }
         Ok(out)
     }

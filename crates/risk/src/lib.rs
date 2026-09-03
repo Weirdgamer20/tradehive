@@ -14,6 +14,8 @@ pub struct RiskLimits {
     pub max_single_position_qty: u32,
     pub max_spread_bps: f64,
     pub max_symbol_exposure: f64,
+    pub max_trade_risk_pct: f64,
+    pub max_portfolio_risk_pct: f64,
 }
 impl Default for RiskLimits {
     fn default() -> Self {
@@ -25,6 +27,8 @@ impl Default for RiskLimits {
             max_single_position_qty: 10,
             max_spread_bps: 250.0,
             max_symbol_exposure: 1500.0,
+            max_trade_risk_pct: 0.01,
+            max_portfolio_risk_pct: 0.05,
         }
     }
 }
@@ -56,6 +60,12 @@ impl RiskLimits {
             max_symbol_exposure: required("RISK_MAX_SYMBOL_EXPOSURE")?
                 .parse()
                 .map_err(|_| RiskError::Invalid("RISK_MAX_SYMBOL_EXPOSURE invalid".into()))?,
+            max_trade_risk_pct: required("RISK_MAX_TRADE_RISK_PCT")?
+                .parse()
+                .map_err(|_| RiskError::Invalid("RISK_MAX_TRADE_RISK_PCT invalid".into()))?,
+            max_portfolio_risk_pct: required("RISK_MAX_PORTFOLIO_RISK_PCT")?
+                .parse()
+                .map_err(|_| RiskError::Invalid("RISK_MAX_PORTFOLIO_RISK_PCT invalid".into()))?,
         };
         limits.validate()?;
         Ok(limits)
@@ -88,6 +98,22 @@ impl RiskLimits {
         if !self.max_symbol_exposure.is_finite() || self.max_symbol_exposure <= 0.0 {
             return Err(RiskError::Invalid(
                 "max_symbol_exposure must be positive".into(),
+            ));
+        }
+        if !self.max_trade_risk_pct.is_finite()
+            || self.max_trade_risk_pct <= 0.0
+            || self.max_trade_risk_pct > 1.0
+        {
+            return Err(RiskError::Invalid(
+                "max_trade_risk_pct must be between 0.0 and 1.0".into(),
+            ));
+        }
+        if !self.max_portfolio_risk_pct.is_finite()
+            || self.max_portfolio_risk_pct <= 0.0
+            || self.max_portfolio_risk_pct > 1.0
+        {
+            return Err(RiskError::Invalid(
+                "max_portfolio_risk_pct must be between 0.0 and 1.0".into(),
             ));
         }
         Ok(())

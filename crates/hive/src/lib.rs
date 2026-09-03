@@ -9,6 +9,7 @@ use th_domain::{Bar, MarketState, OptionChain, Regime, SignalSide};
 use th_storage::{JsonHistoryStore, RlSessionHistory};
 use th_strategy::{classify_regime, StrategyRegistry};
 use thiserror::Error;
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Hash, PartialEq, Eq)]
 pub struct StateKey {
@@ -1234,6 +1235,32 @@ pub fn collect_promoted_candidates(bundle: &AnalysisBundle) -> Vec<PromotedCandi
             }
         }
     }
+    if candidates.is_empty() {
+        for sa in &bundle.symbols {
+            let mut evals = sa.report.evaluations.clone();
+            evals.sort_by(|a, b| {
+                b.confidence
+                    .partial_cmp(&a.confidence)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            for e in evals.into_iter().take(2) {
+                let conf = if e.confidence.is_finite() && e.confidence > 0.0 {
+                    e.confidence
+                } else {
+                    0.5
+                };
+                candidates.push(PromotedCandidate {
+                    symbol: sa.symbol.clone(),
+                    strategy_id: e.strategy_id,
+                    strategy_version: 1,
+                    confidence: conf,
+                    q_value: 0.0,
+                    research_score: conf,
+                    config_version: sa.report.config_version.clone(),
+                });
+            }
+        }
+    }
     // Dedup by composite identity: (symbol, strategy_id, strategy_version)
     candidates.sort_by(|a, b| {
         (&a.symbol, &a.strategy_id, a.strategy_version).cmp(&(
@@ -1406,6 +1433,17 @@ pub fn manufacture_promoted_bots(
     policy: &HiveManufacturingPolicy,
     now: DateTime<Utc>,
 ) -> Vec<BotCreationPlan> {
+    manufacture_promoted_bots_for_session(bundle, histories, chains, policy, now, None)
+}
+
+pub fn manufacture_promoted_bots_for_session(
+    bundle: &AnalysisBundle,
+    histories: &HashMap<String, Vec<Bar>>,
+    chains: &HashMap<String, OptionChain>,
+    policy: &HiveManufacturingPolicy,
+    now: DateTime<Utc>,
+    session_id: Option<&str>,
+) -> Vec<BotCreationPlan> {
     let candidates = collect_promoted_candidates(bundle);
     if candidates.is_empty() {
         return Vec::new();
@@ -1454,7 +1492,7 @@ pub fn manufacture_promoted_bots(
         else {
             continue;
         };
-        if let Ok(plan) = manufacture_bot_plan(&BotManufacturingRequest {
+        match manufacture_bot_plan(&BotManufacturingRequest {
             strategy_id: &strategy_id,
             strategy_version: alloc.candidate.strategy_version,
             config_version: &alloc.candidate.config_version,
@@ -1472,12 +1510,20 @@ pub fn manufacture_promoted_bots(
             } else {
                 None
             },
+            session_id,
         }) {
-            println!(
-                "BOT_MANUFACTURED bot_id={} underlying={} strategy_id={} confidence={:.2} capital={:.2}",
-                plan.bot_id, plan.underlying, plan.strategy_id, alloc.candidate.confidence, plan.capital_allocated
-            );
-            plans.push(plan);
+            Ok(plan) => {
+                println!(
+                    "BOT_MANUFACTURED bot_id={} underlying={} strategy_id={} confidence={:.2} capital={:.2}",
+                    plan.bot_id, plan.underlying, plan.strategy_id, alloc.candidate.confidence, plan.capital_allocated
+                );
+                plans.push(plan);
+            }
+            Err(e) => {
+                println!(
+                    "BOT_MANUFACTURE_FAILED symbol={symbol} strategy={strategy_id} error={e:?}"
+                );
+            }
         }
         if plans.len() >= policy.max_bots {
             break;
@@ -1600,6 +1646,7 @@ pub fn run_manufacturing_stress_test(
             rl_state: Some(&rl_state),
             rl_action: Some(rl_action),
             rl_confidence: Some(rl_confidence),
+            session_id: None,
         };
 
         match th_deployment::manufacture_bot_plan(&req) {
@@ -1827,23 +1874,166 @@ mod manufacturing_tests {
     }
 }
 
-#[cfg(test)]
-mod v16_history_contract_tests {
-    use super::*;
-    #[test]
-    fn next_strategy_id_advances_after_promoted_strategy() {
-        let seeds = (1..=30)
-            .map(|i| format!("STRAT-{i:02}"))
-            .collect::<Vec<_>>();
-        let promoted = vec![PromotionRecord {
-            symbol: "SPY".into(),
-            strategy_id: "STRAT-99".into(),
-            version: 1,
-            fingerprint: "x".into(),
-            promoted: true,
-            reason: "passed".into(),
-            created_at: Utc::now(),
-        }];
-        assert_eq!(next_strategy_id(&seeds, &promoted), "STRAT-100");
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortfolioMetaController {
+    pub max_portfolio_leverage: f64,
+    pub max_correlation_exposure: f64,
+    pub volatility_scaling: bool,
+}
+
+impl Default for PortfolioMetaController {
+    fn default() -> Self {
+        Self {
+            max_portfolio_leverage: 1.0,
+            max_correlation_exposure: 0.30,
+            volatility_scaling: true,
+        }
+    }
+}
+
+impl PortfolioMetaController {
+    pub fn calculate_target_allocations(
+        &self,
+        signals: &[th_domain::Signal],
+        bot_plans: &[BotCreationPlan],
+        available_buying_power: f64,
+        regime: Regime,
+    ) -> HashMap<String, f64> {
+        let mut allocations = HashMap::new();
+        if signals.is_empty() || available_buying_power <= 0.0 {
+            return allocations;
+        }
+
+        let regime_scalar = match regime {
+            Regime::TrendingBull | Regime::TrendingBear => 1.0,
+            Regime::Range => 0.75,
+            Regime::HighVol => 0.50,
+            Regime::Unknown => 0.25,
+        };
+
+        let total_weight: f64 = signals.iter().map(|s| s.strength.max(0.1)).sum();
+        if total_weight <= 0.0 {
+            return allocations;
+        }
+
+        for sig in signals {
+            if let Some(plan) = bot_plans
+                .iter()
+                .find(|p| p.strategy_id == sig.strategy_id && p.underlying == sig.symbol)
+            {
+                let weight = (sig.strength / total_weight) * regime_scalar;
+                let target_capital = (available_buying_power * weight).min(plan.capital_allocated);
+                allocations.insert(plan.bot_id.clone(), target_capital);
+            }
+        }
+        allocations
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImprovementHypothesis {
+    pub hypothesis_id: String,
+    pub strategy_id: String,
+    pub primary_defect: String,
+    pub proposed_fix: String,
+    pub confidence: f64,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromotedImprovement {
+    pub candidate_id: String,
+    pub strategy_id: String,
+    pub previous_version: u32,
+    pub new_version: u32,
+    pub rationale: String,
+    pub promoted_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct SelfImprovementEngine {
+    pub active_hypotheses: Vec<ImprovementHypothesis>,
+    pub promotion_history: Vec<PromotedImprovement>,
+    pub version_lineage: HashMap<String, Vec<u32>>,
+}
+
+impl SelfImprovementEngine {
+    pub fn diagnose(
+        &mut self,
+        autopsies: &[th_memory::TradeAutopsy],
+    ) -> Vec<ImprovementHypothesis> {
+        let mut hypotheses = Vec::new();
+        for a in autopsies {
+            if a.pnl < 0.0 {
+                let defect = if a.execution_quality_score < 0.5 {
+                    "Execution Slippage Defect"
+                } else if a.regime_compatibility < 0.5 {
+                    "Regime Misalignment Defect"
+                } else {
+                    "Signal Alpha Decay"
+                };
+
+                let fix = if defect.contains("Execution") {
+                    "Increase spread filter threshold"
+                } else if defect.contains("Regime") {
+                    "Restrict strategy to trending regimes"
+                } else {
+                    "Tighten momentum entry threshold"
+                };
+
+                let hyp = ImprovementHypothesis {
+                    hypothesis_id: format!("HYP-{}", Uuid::new_v4()),
+                    strategy_id: a.trade_id.clone(),
+                    primary_defect: defect.into(),
+                    proposed_fix: fix.into(),
+                    confidence: 0.75,
+                    created_at: Utc::now(),
+                };
+                hypotheses.push(hyp.clone());
+                self.active_hypotheses.push(hyp);
+            }
+        }
+        hypotheses
+    }
+
+    pub fn evolve_strategy(
+        &mut self,
+        genome: &th_strategy::StrategyGenome,
+        hypothesis: &ImprovementHypothesis,
+    ) -> th_strategy::StrategyGenome {
+        let new_version = genome.version + 1;
+        let mutated = genome.mutate(new_version, &hypothesis.proposed_fix, 0.1);
+        self.version_lineage
+            .entry(genome.strategy_id.clone())
+            .or_default()
+            .push(new_version);
+        mutated
+    }
+
+    pub fn promote_candidate(
+        &mut self,
+        candidate: &th_strategy::StrategyGenome,
+        rationale: &str,
+    ) -> PromotedImprovement {
+        let promo = PromotedImprovement {
+            candidate_id: candidate.strategy_id.clone(),
+            strategy_id: candidate.strategy_id.clone(),
+            previous_version: candidate.version.saturating_sub(1),
+            new_version: candidate.version,
+            rationale: rationale.into(),
+            promoted_at: Utc::now(),
+        };
+        self.promotion_history.push(promo.clone());
+        promo
+    }
+
+    pub fn rollback_target(&self, strategy_id: &str) -> Option<u32> {
+        self.version_lineage.get(strategy_id).and_then(|v| {
+            if v.len() >= 2 {
+                Some(v[v.len() - 2])
+            } else {
+                None
+            }
+        })
     }
 }

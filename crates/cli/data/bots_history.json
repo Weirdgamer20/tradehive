@@ -19406,6 +19406,100 @@
       ],
       "created_at": "2026-09-03T14:34:48.321741300Z",
       "updated_at": "2026-09-03T14:34:48.321741300Z"
+    },
+    {
+      "bot_id": "BOT-3f5a8ed5299b3fa7",
+      "manifest": {
+        "bot_id": "BOT-3f5a8ed5299b3fa7",
+        "capital_allocated": 250000.0,
+        "config_version": "research-1788451450",
+        "created_at": "2026-09-03T16:04:10.117415400Z",
+        "entry_limit": 0.0,
+        "expiry": "2026-09-03T20:04:10.117415400Z",
+        "fingerprint": "3f5a8ed5299b3fa73496f588d167a7a6cabf53fd249ec17ddaa1420053d10b52",
+        "generation_id": "GEN-DEFAULT",
+        "max_capital_exposure": 250000.0,
+        "max_expiry_minutes": 4294967295,
+        "min_expiry_minutes": 180,
+        "option_symbol": "QQQ-480--10",
+        "option_type": "Call",
+        "plan_id": "PLAN-3f5a8ed5299b3fa7",
+        "quantity": 0,
+        "risk_budget": 12500.0,
+        "risk_pct": 0.05,
+        "rl_action": null,
+        "rl_confidence": 1.0,
+        "rl_state": null,
+        "session_id": "SESSION-20260903",
+        "stop_loss_pct": 0.0,
+        "strategy_id": "trend_strength_momentum",
+        "strategy_version": 1,
+        "strike": 480.0,
+        "take_profit_pct": 0.0,
+        "underlying": "QQQ"
+      },
+      "state": {
+        "status": "MANUFACTURED"
+      },
+      "positions": [],
+      "signals": [],
+      "orders": [],
+      "trades": [],
+      "lifecycle": [
+        {
+          "event": "MANUFACTURED",
+          "timestamp": "2026-09-03T16:04:10.117415400Z"
+        }
+      ],
+      "created_at": "2026-09-03T16:04:10.117415400Z",
+      "updated_at": "2026-09-03T16:04:10.117415400Z"
+    },
+    {
+      "bot_id": "BOT-807e7b5b836f9953",
+      "manifest": {
+        "bot_id": "BOT-807e7b5b836f9953",
+        "capital_allocated": 250000.0,
+        "config_version": "research-1788451451",
+        "created_at": "2026-09-03T16:04:10.117415400Z",
+        "entry_limit": 0.0,
+        "expiry": "2026-09-03T20:04:10.117415400Z",
+        "fingerprint": "807e7b5b836f9953d65bd1a1fc4321c8e25c23e7cdeca919d986491a740e75df",
+        "generation_id": "GEN-DEFAULT",
+        "max_capital_exposure": 250000.0,
+        "max_expiry_minutes": 4294967295,
+        "min_expiry_minutes": 180,
+        "option_symbol": "SPY-480--10",
+        "option_type": "Call",
+        "plan_id": "PLAN-807e7b5b836f9953",
+        "quantity": 0,
+        "risk_budget": 12500.0,
+        "risk_pct": 0.05,
+        "rl_action": null,
+        "rl_confidence": 1.0,
+        "rl_state": null,
+        "session_id": "SESSION-20260903",
+        "stop_loss_pct": 0.0,
+        "strategy_id": "trend_strength_momentum",
+        "strategy_version": 1,
+        "strike": 480.0,
+        "take_profit_pct": 0.0,
+        "underlying": "SPY"
+      },
+      "state": {
+        "status": "MANUFACTURED"
+      },
+      "positions": [],
+      "signals": [],
+      "orders": [],
+      "trades": [],
+      "lifecycle": [
+        {
+          "event": "MANUFACTURED",
+          "timestamp": "2026-09-03T16:04:10.117415400Z"
+        }
+      ],
+      "created_at": "2026-09-03T16:04:10.117415400Z",
+      "updated_at": "2026-09-03T16:04:10.117415400Z"
     }
   ]
 }

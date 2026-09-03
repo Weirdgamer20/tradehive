@@ -36,6 +36,8 @@ impl SentinelSnapshot {
 pub enum SentinelError {
     #[error("trading cannot be enabled while sentinel is unhealthy")]
     Unhealthy,
+    #[error("unauthorized governance action: {0}")]
+    Unauthorized(String),
 }
 #[derive(Debug, Default)]
 pub struct Sentinel {
@@ -82,4 +84,50 @@ impl Sentinel {
             Err(SentinelError::Unhealthy)
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GovernanceGuard {
+    policy: th_domain::GovernancePolicy,
+}
+
+impl GovernanceGuard {
+    pub fn new(policy: th_domain::GovernancePolicy) -> Self {
+        Self { policy }
+    }
+
+    pub fn policy(&self) -> &th_domain::GovernancePolicy {
+        &self.policy
+    }
+
+    pub fn verify_action(&self, auth: th_domain::AuthorizationClass) -> Result<(), SentinelError> {
+        if self.policy.is_authorized(auth) {
+            Ok(())
+        } else {
+            Err(SentinelError::Unauthorized(format!("{auth:?}")))
+        }
+    }
+
+    pub fn authorize_capital_allocation(
+        &self,
+        requested: f64,
+        live: bool,
+    ) -> Result<(), SentinelError> {
+        if live {
+            self.verify_action(th_domain::AuthorizationClass::LiveExecution)?;
+            if requested > self.policy.max_live_capital {
+                return Err(SentinelError::Unauthorized(format!(
+                    "Requested capital {requested:.2} exceeds live governance limit {:.2}",
+                    self.policy.max_live_capital
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum GovernanceError {
+    #[error("unauthorized governance action: {0}")]
+    Unauthorized(String),
 }

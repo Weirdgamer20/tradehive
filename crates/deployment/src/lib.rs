@@ -59,6 +59,8 @@ pub struct BotCreationPlan {
     pub rl_action: Option<String>,
     #[serde(default = "default_rl_confidence")]
     pub rl_confidence: f64,
+    #[serde(default)]
+    pub session_id: String,
 }
 
 fn default_generation_id() -> String {
@@ -200,6 +202,7 @@ pub struct BotManufacturingRequest<'a> {
     pub rl_state: Option<&'a str>,
     pub rl_action: Option<&'a str>,
     pub rl_confidence: Option<f64>,
+    pub session_id: Option<&'a str>,
 }
 
 /// Hive-side bot manufacturing. This converts a validated research decision and a
@@ -252,6 +255,7 @@ pub fn manufacture_bot_plan(
     let rl_state = req.rl_state.map(|s| s.to_string());
     let rl_action = req.rl_action.map(|s| s.to_string());
     let rl_confidence = req.rl_confidence.unwrap_or(1.0);
+    let session_id = req.session_id.unwrap_or("").to_string();
 
     Ok(BotCreationPlan {
         plan_id: format!("PLAN-{}", &fingerprint[..16]),
@@ -280,6 +284,7 @@ pub fn manufacture_bot_plan(
         rl_state,
         rl_action,
         rl_confidence,
+        session_id,
     })
 }
 
@@ -320,6 +325,7 @@ mod tests {
             rl_state: Some("test_state"),
             rl_action: Some("BuyCall"),
             rl_confidence: Some(0.9),
+            session_id: Some("SESSION-001"),
         })
         .unwrap();
         assert_eq!(p.strategy_id, "momentum");
@@ -329,6 +335,7 @@ mod tests {
         assert_eq!(p.generation_id, "GEN-TEST");
         assert_eq!(p.risk_pct, 0.10);
         assert_eq!(p.rl_confidence, 0.9);
+        assert_eq!(p.session_id, "SESSION-001");
         assert!(p.capital_allocated > 0.0);
         assert!(!p.fingerprint.is_empty());
     }
@@ -351,6 +358,7 @@ mod tests {
                 rl_state: None,
                 rl_action: None,
                 rl_confidence: None,
+                session_id: None,
             }),
             Err(DeploymentError::InvalidExpiryHorizon)
         ));
@@ -375,6 +383,7 @@ mod tests {
             rl_state: None,
             rl_action: None,
             rl_confidence: None,
+            session_id: None,
         })
         .unwrap();
         assert_eq!(p.quantity, 0);
