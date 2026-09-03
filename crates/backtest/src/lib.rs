@@ -490,8 +490,9 @@ impl OptionBacktestEngine {
                         self.compute_bs_exit(bar.open, pos.strike, bars_held, dte_days, ty)
                     };
 
-                    let fees =
-                        (pos.entry_px + exit_px) * self.cfg.multiplier * (self.cfg.fee_bps / 10_000.0);
+                    let fees = (pos.entry_px + exit_px)
+                        * self.cfg.multiplier
+                        * (self.cfg.fee_bps / 10_000.0);
                     let pnl = (exit_px - pos.entry_px) * self.cfg.multiplier - fees;
 
                     trades.push(TradeResult {
@@ -537,7 +538,8 @@ impl OptionBacktestEngine {
                                 entry: pos.entry_px,
                                 exit: exit_px,
                                 pnl,
-                                slippage_incurred: (pos.entry_slip + exit_slip) * self.cfg.multiplier,
+                                slippage_incurred: (pos.entry_slip + exit_slip)
+                                    * self.cfg.multiplier,
                                 spread_cost: (pos.entry_spread + exit_spread) * self.cfg.multiplier,
                                 fees_paid: fees,
                                 bars_held,
@@ -612,7 +614,8 @@ impl OptionBacktestEngine {
             let bars_held = bars.len().saturating_sub(pos.ei);
             let (exit_px, exit_slip, exit_spread) =
                 self.compute_bs_exit(b.close, pos.strike, bars_held, dte_days, ty);
-            let fees = (pos.entry_px + exit_px) * self.cfg.multiplier * (self.cfg.fee_bps / 10_000.0);
+            let fees =
+                (pos.entry_px + exit_px) * self.cfg.multiplier * (self.cfg.fee_bps / 10_000.0);
             let pnl = (exit_px - pos.entry_px) * self.cfg.multiplier - fees;
             trades.push(TradeResult {
                 entry_ts: pos.ets,

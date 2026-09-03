@@ -60,13 +60,23 @@ async fn run_autonomous(max_ticks: Option<usize>) -> Result<(), Box<dyn std::err
     let is_paper = trading_url.contains("paper-api.alpaca.markets");
     let is_live = !is_paper && trading_url.contains("api.alpaca.markets");
 
+    if is_live && std::env::var("TRADING_HIVE_LIVE_CONFIRM").as_deref() != Ok("YES") {
+        return Err(
+            "LIVE trading requested but TRADING_HIVE_LIVE_CONFIRM=YES is not set; failing closed for safety"
+                .into(),
+        );
+    }
+
     println!("HIVE_STARTED");
     println!("MODE={}", if is_live { "LIVE" } else { "PAPER" });
+    println!("BROKER=ALPACA");
+    println!("MARKET_DATA=ALPACA");
     println!("AUTONOMOUS=true");
-    println!("PRODUCTION_PROVIDER=ALPACA");
     println!("UNIVERSE_SOURCE=ALPACA_SCREENER");
 
     let cfg = production_config()?;
+    let _risk_limits = th_risk::RiskLimits::from_env()?;
+    println!("CONFIG_VALIDATED version={}", cfg.config_version);
 
     let md = AlpacaConfig {
         key: key.clone(),
@@ -81,6 +91,26 @@ async fn run_autonomous(max_ticks: Option<usize>) -> Result<(), Box<dyn std::err
     };
     let provider = AlpacaProvider::new(md)?;
     let broker = AlpacaBroker::new(trading_url, key, secret, is_live)?;
+
+    use th_execution::Broker;
+    let acct = broker
+        .account()
+        .await
+        .map_err(|e| format!("BROKER_AUTH_FAILED: {e}"))?;
+    println!(
+        "BROKER_CONNECTED equity={:.2} cash={:.2} buying_power={:.2}",
+        acct.equity, acct.cash, acct.buying_power
+    );
+
+    let clock = broker
+        .clock()
+        .await
+        .map_err(|e| format!("MARKET_DATA_FAILED: {e}"))?;
+    println!(
+        "MARKET_DATA_CONNECTED is_open={} next_open={:?} next_close={:?}",
+        clock.is_open, clock.next_open, clock.next_close
+    );
+
     let mut runtime = TradingRuntime::new(cfg, broker, provider)?;
     match max_ticks {
         Some(n) => {

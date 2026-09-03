@@ -3,7 +3,7 @@ use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use th_deployment::{BotCreationPlan, BotFleet};
-use th_domain::{Bar, OrderIntent, OrderSide, OrderStatus, SessionPhase};
+use th_domain::{Bar, OptionOrderAction, OrderIntent, OrderSide, OrderStatus, SessionPhase};
 use th_execution::{order_hash, reconcile_positions, Broker, ExecutionEngine};
 use th_hive::{
     manufacture_promoted_bots_for_session, run_analysis_with_q_and_trades, AnalysisBundle,
@@ -436,13 +436,15 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
         let risk_limits =
             RiskLimits::from_env().map_err(|e| RuntimeError::InvalidConfig(e.to_string()))?;
         let execution = ExecutionEngine::new(broker, RiskGovernor::new(risk_limits));
+        let market_clock = th_domain::MarketSessionClock::from_env();
+        let initial_active = market_clock.phase_at(now).allows_new_entries();
         Ok(Self {
             strategies,
             execution,
             provider,
             store,
             bars,
-            active: cfg.phase_at(now) == SessionPhase::Trading,
+            active: initial_active,
             candles: MultiSymbolCandleEngine::new(cfg.max_event_ids),
             open_trades,
             bot_plans,
@@ -460,7 +462,7 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
             health: RuntimeHealth::Healthy,
             control_epoch: 0,
             json_history,
-            market_clock: th_domain::MarketSessionClock::from_env(),
+            market_clock,
             current_session_id: None,
             active_universe: Vec::new(),
             phase_override: None,
@@ -472,10 +474,10 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
         })
     }
     pub fn phase_at(&self, dt: DateTime<Utc>) -> SessionPhase {
-        self.cfg.phase_at(dt)
+        self.market_session_phase(dt)
     }
     pub fn phase(&self) -> SessionPhase {
-        self.phase_at(Utc::now())
+        self.market_session_phase(Utc::now())
     }
     pub fn market_session_phase(&self, dt: DateTime<Utc>) -> SessionPhase {
         if let Some(p) = self.phase_override {
@@ -586,9 +588,9 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
             .bot_plans
             .values()
             .filter(|p| {
-                let session_match = match (&self.current_session_id, &p.session_id) {
-                    (Some(curr), plan_sid) if !plan_sid.is_empty() => curr == plan_sid,
-                    _ => true,
+                let session_match = match &self.current_session_id {
+                    Some(curr) if !p.session_id.is_empty() => curr == &p.session_id,
+                    _ => false,
                 };
                 session_match && p.underlying == candle.symbol
             })
@@ -713,7 +715,7 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                     session_id: self.current_session_id.clone(),
                     decision_id: None,
                     oms_state: Some(th_domain::OmsState::IntentCreated),
-                    option_action: None,
+                    option_action: Some(OptionOrderAction::SellToClose),
                 };
                 order.order_hash = order_hash(&order);
                 let spread = q.spread_bps();
@@ -952,9 +954,9 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
             .bot_plans
             .values()
             .find(|p| {
-                let session_match = match (&self.current_session_id, &p.session_id) {
-                    (Some(curr), plan_sid) if !plan_sid.is_empty() => curr == plan_sid,
-                    _ => true,
+                let session_match = match &self.current_session_id {
+                    Some(curr) if !p.session_id.is_empty() => curr == &p.session_id,
+                    _ => false,
                 };
                 session_match && p.strategy_id == sig.strategy_id && p.underlying == sig.symbol
             })
@@ -971,7 +973,7 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
             th_domain::SignalSide::Flat => return Ok(()),
         };
         let now = Utc::now();
-        if self.market_session_phase(now) != SessionPhase::MarketOpen {
+        if !self.market_session_phase(now).allows_new_entries() {
             println!("MARKET_NOT_OPEN phase={:?}", self.market_session_phase(now));
             return Err(RuntimeError::Market("MARKET_NOT_OPEN".into()));
         }
@@ -1007,6 +1009,11 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
             })
             .cloned()
             .ok_or(RuntimeError::NoOption)?;
+
+        println!(
+            "OPTION_SELECTED symbol={} contract_symbol={} strike={:.2} expiry={} bid={:.2} ask={:.2} spread_bps={:.1}",
+            sig.symbol, quote.symbol, quote.strike, quote.expiry, quote.bid, quote.ask, quote.spread_bps()
+        );
         let news = self
             .provider
             .news(
@@ -1162,6 +1169,10 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
             return Err(RuntimeError::NoOption);
         }
         println!(
+            "RISK_APPROVED symbol={} contract_symbol={} qty={} limit_price={:.2}",
+            sig.symbol, quote.symbol, qty, px
+        );
+        println!(
             "ORDER_REQUESTED symbol={} option_symbol={} qty={} limit_price={:.2} strategy_id={} strength={:.2}",
             sig.symbol, quote.symbol, qty, px, sig.strategy_id, sig.strength
         );
@@ -1182,9 +1193,13 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                 .or_else(|| self.current_session_id.clone()),
             decision_id: Some(sig.id),
             oms_state: Some(th_domain::OmsState::IntentCreated),
-            option_action: None,
+            option_action: Some(OptionOrderAction::BuyToOpen),
         };
         order.order_hash = order_hash(&order);
+        println!(
+            "ORDER_INTENT_CREATED client_order_id={} symbol={} action={:?} qty={} limit_price={:.2}",
+            order.client_order_id, order.symbol, order.option_action, order.qty, px
+        );
         if let Some((broker_id, status)) = self
             .store
             .idempotency_status(order.client_order_id)
@@ -1223,9 +1238,24 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
             }
         };
         println!(
-            "ORDER_SUBMITTED broker_order_id={} status={:?} symbol={} qty={}",
-            bo.broker_order_id, bo.status, order.symbol, order.qty
+            "ORDER_SUBMITTED client_order_id={} broker_order_id={} status={:?} symbol={} qty={}",
+            order.client_order_id, bo.broker_order_id, bo.status, order.symbol, order.qty
         );
+        match bo.status {
+            OrderStatus::Accepted | OrderStatus::New => {
+                println!(
+                    "ORDER_ACCEPTED client_order_id={} broker_order_id={}",
+                    order.client_order_id, bo.broker_order_id
+                );
+            }
+            OrderStatus::Rejected | OrderStatus::Cancelled => {
+                println!(
+                    "ORDER_REJECTED client_order_id={} broker_order_id={} status={:?}",
+                    order.client_order_id, bo.broker_order_id, bo.status
+                );
+            }
+            _ => {}
+        }
         self.store
             .set_idempotency(
                 order.client_order_id,
@@ -1260,6 +1290,17 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
             payload: serde_json::json!({"status": format!("{:?}", bo.status)}),
         });
         if bo.filled_qty > 0 {
+            if bo.filled_qty < order.qty {
+                println!(
+                    "ORDER_PARTIALLY_FILLED client_order_id={} broker_order_id={} filled_qty={} remaining={}",
+                    order.client_order_id, bo.broker_order_id, bo.filled_qty, order.qty - bo.filled_qty
+                );
+            } else {
+                println!(
+                    "ORDER_FILLED client_order_id={} broker_order_id={} filled_qty={}",
+                    order.client_order_id, bo.broker_order_id, bo.filled_qty
+                );
+            }
             if let Some(fp) = bo.filled_avg_price {
                 let fill = th_domain::Fill {
                     fill_id: Uuid::new_v4(),
@@ -1410,6 +1451,16 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
             self.active = false;
             self.health = RuntimeHealth::Degraded;
             self.execution.risk_mut().engage_kill_switch();
+            println!(
+                "POSITION_MISMATCH missing_internal={:?} missing_broker={:?}",
+                report.missing_internal, report.missing_broker
+            );
+            println!("KILL_SWITCH_ENGAGED reason=reconciliation_mismatch");
+        } else {
+            println!(
+                "POSITION_RECONCILED count={} broker_count={}",
+                report.internal_count, report.broker_count
+            );
         }
         Ok(report.matched)
     }
@@ -1654,6 +1705,7 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
             .map(|(s, _)| s)
             .collect();
 
+        println!("UNIVERSE_DISCOVERED symbols={:?}", selected);
         println!("UNIVERSE_SELECTED symbols={:?}", selected);
         self.active_universe = selected.clone();
         Ok(selected)
@@ -2058,6 +2110,7 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
             self.active = true;
             self.health = RuntimeHealth::Healthy;
             self.fleet.activate_all();
+            println!("BOT_ACTIVATED count={}", self.bot_plans.len());
             println!("BOTS_ACTIVATED count={}", self.bot_plans.len());
             println!("MARKET_OPEN session_id={session_id}");
             println!("TRADING_ENABLED session_id={session_id}");
@@ -2066,6 +2119,7 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
     }
 
     pub async fn execute_market_closing(&mut self, session_id: &str) -> Result<(), RuntimeError> {
+        println!("MARKET_CLOSE session_id={session_id}");
         println!("MARKET_CLOSING session_id={session_id}");
         self.active = false;
         println!("TRADING_DISABLED session_id={session_id}");
@@ -2131,7 +2185,7 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                 session_id: self.current_session_id.clone(),
                 decision_id: None,
                 oms_state: Some(th_domain::OmsState::IntentCreated),
-                option_action: None,
+                option_action: Some(OptionOrderAction::SellToClose),
             };
             order.order_hash = order_hash(&order);
 
@@ -2151,11 +2205,21 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                 continue;
             }
 
-            let (bo, _) = self
+            println!(
+                "FLATTEN_SUBMITTED client_order_id={} symbol={} qty={}",
+                order.client_order_id, order.symbol, order.qty
+            );
+            let (mut bo, _) = self
                 .execution
                 .execute(order.clone(), mark, spread, &portfolio)
                 .await
                 .map_err(|e| RuntimeError::Execution(e.to_string()))?;
+
+            if bo.status == OrderStatus::New || bo.status == OrderStatus::Accepted {
+                if let Ok(resolved) = self.execution.reconcile_order(&bo.broker_order_id).await {
+                    bo = resolved;
+                }
+            }
 
             let _ = self.store.set_idempotency(
                 order.client_order_id,
@@ -2165,6 +2229,10 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
 
             match bo.status {
                 OrderStatus::Filled => {
+                    println!(
+                        "FLATTEN_FILLED client_order_id={} broker_order_id={} filled_qty={}",
+                        order.client_order_id, bo.broker_order_id, bo.filled_qty
+                    );
                     let fp = bo.filled_avg_price.unwrap_or(mark);
                     let pnl = (fp - t.entry_price)
                         * bo.filled_qty as f64
@@ -2464,6 +2532,7 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
         self.current_session_id = Some(session_id.clone());
 
         let initial_phase = self.market_session_phase(now);
+        println!("MARKET_SESSION_CHANGED from=NONE to={:?}", initial_phase);
         println!("SESSION_PHASE_CHANGED from=NONE to={:?}", initial_phase);
         let mut last_phase = Some(initial_phase);
 
@@ -2547,6 +2616,10 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
             let current_phase = self.market_session_phase(now);
             if Some(current_phase) != last_phase {
                 if let Some(prev) = last_phase {
+                    println!(
+                        "MARKET_SESSION_CHANGED from={:?} to={:?}",
+                        prev, current_phase
+                    );
                     println!(
                         "SESSION_PHASE_CHANGED from={:?} to={:?}",
                         prev, current_phase
@@ -2672,6 +2745,13 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         }
 
+        println!(
+            "SESSION_COMPLETE trades_opened={} trades_closed={} realized_pnl={:.2} rejected_orders={}",
+            self.stats.trades_opened,
+            self.stats.trades_closed,
+            self.stats.realized_pnl,
+            self.stats.rejected_orders
+        );
         println!(
             "SESSION_COMPLETED trades_opened={} trades_closed={} realized_pnl={:.2} rejected_orders={}",
             self.stats.trades_opened,
