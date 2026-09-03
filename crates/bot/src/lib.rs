@@ -713,6 +713,7 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                     session_id: self.current_session_id.clone(),
                     decision_id: None,
                     oms_state: Some(th_domain::OmsState::IntentCreated),
+                    option_action: None,
                 };
                 order.order_hash = order_hash(&order);
                 let spread = q.spread_bps();
@@ -1181,6 +1182,7 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                 .or_else(|| self.current_session_id.clone()),
             decision_id: Some(sig.id),
             oms_state: Some(th_domain::OmsState::IntentCreated),
+            option_action: None,
         };
         order.order_hash = order_hash(&order);
         if let Some((broker_id, status)) = self
@@ -1363,6 +1365,7 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                 avg_price: t.entry_price,
                 mark: t.entry_price,
                 opened_at: t.entry_ts,
+                contract: th_domain::OptionContract::from_occ(&t.symbol),
             })
             .collect::<Vec<_>>();
         // Crash-consistent in-flight order reconciliation
@@ -2128,6 +2131,7 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                 session_id: self.current_session_id.clone(),
                 decision_id: None,
                 oms_state: Some(th_domain::OmsState::IntentCreated),
+                option_action: None,
             };
             order.order_hash = order_hash(&order);
 

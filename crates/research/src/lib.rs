@@ -399,22 +399,13 @@ impl IndependentEvaluator {
         total_trials: usize,
     ) -> IndependentEvaluationResult {
         let backtester = th_backtest::Backtester::new(th_backtest::BacktestConfig::default());
-        let full_report =
-            backtester
-                .run(strategy, bars)
-                .unwrap_or_else(|_| th_backtest::BacktestReport {
-                    strategy_id: strategy_id.into(),
-                    initial_cash: 10_000.0,
-                    final_cash: 10_000.0,
-                    trades: Vec::new(),
-                    net_pnl: 0.0,
-                    win_rate: 0.0,
-                    profit_factor: 0.0,
-                    max_drawdown: 0.0,
-                    sharpe: 0.0,
-                    turnover: 0.0,
-                    execution_model: th_backtest::ExecutionModel::Realistic,
-                });
+        let full_report = backtester.run(strategy, bars).unwrap_or_else(|_| {
+            th_backtest::BacktestReport::empty(
+                strategy_id,
+                10_000.0,
+                th_backtest::ExecutionModel::Realistic,
+            )
+        });
 
         // Walk-Forward Analysis with 3 windows, 2 bars purge, 2 bars embargo
         let windows = walk_forward_with_purging(strategy, bars, 3, 2, 2);
@@ -619,5 +610,83 @@ impl AdversarialEvaluator {
             overall_approved: overall,
             reasoning: reasons,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_psr_and_deflated_sharpe_ratio() {
+        let sr = 1.8;
+        let benchmark_sr = 0.0;
+        let n_obs = 252;
+        let skew = -0.2;
+        let kurt = 3.5;
+
+        let psr = probabilistic_sharpe_ratio(sr, benchmark_sr, n_obs, skew, kurt);
+        assert!(psr > 0.95, "Sharpe 1.8 over 252 obs should have high PSR");
+
+        // DSR with 1 trial should equal PSR with benchmark 0
+        let dsr_1 = deflated_sharpe_ratio(sr, 1, n_obs, skew, kurt);
+        assert!((dsr_1 - psr).abs() < 1e-4);
+
+        // DSR with 500 trials should significantly deflate the significance
+        let dsr_500 = deflated_sharpe_ratio(sr, 500, n_obs, skew, kurt);
+        assert!(
+            dsr_500 < dsr_1,
+            "DSR must decrease as trial count increases"
+        );
+    }
+
+    #[test]
+    fn test_cscv_pbo_computation() {
+        // 100 observations across 5 candidates
+        let candidate_returns = vec![
+            vec![0.01; 100],
+            vec![0.005; 100],
+            vec![-0.002; 100],
+            vec![0.015; 100],
+            vec![0.008; 100],
+        ];
+
+        let pbo = probability_of_backtest_overfitting(&candidate_returns);
+        assert!((0.0..=1.0).contains(&pbo), "PBO must be in [0, 1]");
+    }
+
+    #[test]
+    fn test_monte_carlo_permutation_test() {
+        let trades = vec![
+            th_backtest::TradeResult {
+                entry_ts: 0,
+                exit_ts: 1,
+                side: th_domain::SignalSide::LongCall,
+                entry: 10.0,
+                exit: 12.0,
+                pnl: 200.0,
+                slippage_incurred: 1.0,
+                spread_cost: 2.0,
+                fees_paid: 1.0,
+                bars_held: 3,
+                contract_symbol: None,
+            },
+            th_backtest::TradeResult {
+                entry_ts: 2,
+                exit_ts: 3,
+                side: th_domain::SignalSide::LongCall,
+                entry: 10.0,
+                exit: 8.0,
+                pnl: -200.0,
+                slippage_incurred: 1.0,
+                spread_cost: 2.0,
+                fees_paid: 1.0,
+                bars_held: 2,
+                contract_symbol: None,
+            },
+        ];
+
+        let p_val = monte_carlo_permutation_test(&trades, 100);
+        assert!((0.0..=1.0).contains(&p_val));
     }
 }

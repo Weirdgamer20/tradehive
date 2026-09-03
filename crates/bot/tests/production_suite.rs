@@ -56,6 +56,7 @@ async fn test_order_crash_and_unknown_recovery() {
         session_id: Some("SESSION-1".into()),
         decision_id: Some(Uuid::new_v4()),
         oms_state: Some(OmsState::Unknown),
+        option_action: None,
     };
 
     assert!(order.oms_state.unwrap().is_ambiguous());
@@ -95,6 +96,7 @@ fn test_duplicate_fill_recovery() {
             avg_price: 5.0,
             mark: 5.0,
             opened_at: Utc::now(),
+            contract: th_domain::OptionContract::from_occ(symbol),
         },
     );
 
@@ -232,6 +234,7 @@ fn test_walk_forward_purged_embargo_and_overfitting_defense() {
             spread_cost: 5.0,
             fees_paid: 1.5,
             bars_held: 5,
+            contract_symbol: None,
         },
         TradeResult {
             entry_ts: 1,
@@ -244,6 +247,7 @@ fn test_walk_forward_purged_embargo_and_overfitting_defense() {
             spread_cost: 5.0,
             fees_paid: 1.5,
             bars_held: 4,
+            contract_symbol: None,
         },
         TradeResult {
             entry_ts: 2,
@@ -256,6 +260,7 @@ fn test_walk_forward_purged_embargo_and_overfitting_defense() {
             spread_cost: 5.0,
             fees_paid: 1.5,
             bars_held: 3,
+            contract_symbol: None,
         },
         TradeResult {
             entry_ts: 3,
@@ -268,6 +273,7 @@ fn test_walk_forward_purged_embargo_and_overfitting_defense() {
             spread_cost: 5.0,
             fees_paid: 1.5,
             bars_held: 3,
+            contract_symbol: None,
         },
         TradeResult {
             entry_ts: 4,
@@ -280,6 +286,7 @@ fn test_walk_forward_purged_embargo_and_overfitting_defense() {
             spread_cost: 5.0,
             fees_paid: 1.5,
             bars_held: 6,
+            contract_symbol: None,
         },
     ];
     let p_val = monte_carlo_permutation_test(&trades, 100);
@@ -342,7 +349,177 @@ fn test_portfolio_concentration_and_daily_drawdown_halt() {
         session_id: None,
         decision_id: None,
         oms_state: None,
+        option_action: None,
     };
     let res = governor.authorize(&order, 2.0, 50.0, &breach_portfolio);
     assert!(res.is_err(), "Daily loss breach must halt new order entry");
+}
+
+// 8. Option instrument and contract integrity test (Section 6, 9)
+#[test]
+fn test_option_instrument_and_contract_integrity() {
+    let sym = "SPY260904P00495000";
+    let contract =
+        th_domain::OptionContract::from_occ(sym).expect("must parse valid OCC option symbol");
+    assert_eq!(contract.underlying, "SPY");
+    assert_eq!(contract.strike, 495.0);
+    assert_eq!(contract.multiplier, 100.0);
+    assert_eq!(contract.option_type, th_domain::OptionType::Put);
+
+    let pos = Position::new(sym, 3, 4.0, 4.8, Utc::now());
+    assert_eq!(pos.unrealized_pnl(), (4.8 - 4.0) * 3.0 * 100.0);
+    assert!(pos.contract.is_some());
+}
+
+// 9. Underlying vs Option backtest divergence test (Section 0, 9, 10)
+#[test]
+fn test_underlying_vs_option_backtest_divergence() {
+    use th_backtest::{BacktestConfig, OptionBacktestEngine, UnderlyingBacktestEngine};
+    use th_domain::Bar;
+    use th_strategy::{Strategy, StrategySpec};
+
+    struct TestLongCallStrat {
+        spec: StrategySpec,
+        step: usize,
+    }
+    impl Strategy for TestLongCallStrat {
+        fn spec(&self) -> &StrategySpec {
+            &self.spec
+        }
+        fn update(
+            &mut self,
+            bar: &Bar,
+            _state: &th_domain::MarketState,
+        ) -> Option<th_domain::Signal> {
+            self.step += 1;
+            if self.step == 6 {
+                Some(th_domain::Signal {
+                    id: Uuid::new_v4(),
+                    strategy_id: self.spec.id.clone(),
+                    symbol: bar.symbol.clone(),
+                    side: th_domain::SignalSide::LongCall,
+                    strength: 1.0,
+                    reason: "entry".into(),
+                    generated_at: bar.ts,
+                    config_version: "v1".into(),
+                    session_id: None,
+                    bot_id: None,
+                    candidate_id: None,
+                })
+            } else {
+                None
+            }
+        }
+    }
+
+    let base = Utc::now();
+    let bars: Vec<Bar> = (0..35)
+        .map(|i| {
+            let px = 500.0 + (i as f64) * 0.5;
+            Bar {
+                symbol: "SPY".into(),
+                open: px,
+                high: px + 0.5,
+                low: px - 0.5,
+                close: px + 0.2,
+                volume: 10_000.0,
+                ts: base + chrono::Duration::minutes(5 * i as i64),
+            }
+        })
+        .collect();
+
+    let mut strat_opt = TestLongCallStrat {
+        spec: StrategySpec {
+            id: "opt_strat".into(),
+            name: "Opt Strat".into(),
+            version: 1,
+            warmup: 5,
+            max_hold_bars: 5,
+            enabled: true,
+            description: "opt test".into(),
+        },
+        step: 0,
+    };
+    let mut strat_und = TestLongCallStrat {
+        spec: StrategySpec {
+            id: "und_strat".into(),
+            name: "Und Strat".into(),
+            version: 1,
+            warmup: 5,
+            max_hold_bars: 5,
+            enabled: true,
+            description: "und test".into(),
+        },
+        step: 0,
+    };
+
+    let opt_engine = OptionBacktestEngine::new(BacktestConfig::default());
+    let und_engine = UnderlyingBacktestEngine::new(BacktestConfig::default());
+
+    let opt_rep = opt_engine
+        .run(&mut strat_opt, &bars)
+        .expect("option backtest must succeed");
+    let und_rep = und_engine
+        .run(&mut strat_und, &bars)
+        .expect("underlying backtest must succeed");
+
+    assert!(
+        !opt_rep.trades.is_empty(),
+        "Option backtest must generate option trades"
+    );
+    assert!(
+        !und_rep.trades.is_empty(),
+        "Underlying backtest must generate stock trades"
+    );
+
+    // Option trade uses option contract premium ($~3.0 - $5.0 range * 100 multiplier)
+    // Underlying trade uses spot share price ($500+ range)
+    let opt_entry = opt_rep.trades[0].entry;
+    let und_entry = und_rep.trades[0].entry;
+    assert!(
+        opt_entry < 20.0,
+        "Option trade entry should reflect option premium, got: {}",
+        opt_entry
+    );
+    assert!(
+        und_entry >= 500.0,
+        "Underlying trade entry should reflect stock price, got: {}",
+        und_entry
+    );
+}
+
+// 10. Option order actions & Alpaca position intent (Section 18)
+#[test]
+fn test_option_order_actions_and_alpaca_position_intent() {
+    use th_domain::OptionOrderAction;
+
+    let bto = OptionOrderAction::BuyToOpen;
+    assert_eq!(bto.as_str(), "buy_to_open");
+    let btc = OptionOrderAction::BuyToClose;
+    assert_eq!(btc.as_str(), "buy_to_close");
+    let sto = OptionOrderAction::SellToOpen;
+    assert_eq!(sto.as_str(), "sell_to_open");
+    let stc = OptionOrderAction::SellToClose;
+    assert_eq!(stc.as_str(), "sell_to_close");
+
+    let intent = OrderIntent {
+        client_order_id: Uuid::new_v4(),
+        symbol: "SPY260904C00500000".into(),
+        side: OrderSide::Sell,
+        qty: 1,
+        limit_price: Some(3.50),
+        reduce_only: true,
+        strategy_id: "s1".into(),
+        created_at: Utc::now(),
+        order_hash: "hash".into(),
+        bot_id: None,
+        session_id: None,
+        decision_id: None,
+        oms_state: None,
+        option_action: None,
+    };
+    assert_eq!(
+        intent.resolve_option_action(),
+        OptionOrderAction::SellToClose
+    );
 }

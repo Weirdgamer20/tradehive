@@ -204,6 +204,7 @@ impl Broker for PaperBroker {
                 avg_price: px,
                 mark: px,
                 opened_at: now,
+                contract: th_domain::OptionContract::from_occ(&o.symbol),
             });
             let old = e.qty.max(0) as f64;
             e.avg_price = if old > 0.0 {
@@ -547,8 +548,8 @@ impl Broker for AlpacaBroker {
         Ok(xs
             .into_iter()
             .filter_map(|x| {
+                let sym = x.get("symbol")?.as_str()?.to_string();
                 Some(Position {
-                    symbol: x.get("symbol")?.as_str()?.into(),
                     qty: x.get("qty")?.as_str()?.parse().ok()?,
                     avg_price: x.get("avg_entry_price")?.as_str()?.parse().ok()?,
                     mark: x
@@ -557,6 +558,8 @@ impl Broker for AlpacaBroker {
                         .and_then(|s| s.parse().ok())
                         .unwrap_or(0.0),
                     opened_at: Utc::now(),
+                    contract: th_domain::OptionContract::from_occ(&sym),
+                    symbol: sym,
                 })
             })
             .collect())
@@ -786,5 +789,66 @@ pub fn reconcile_positions(internal: &[Position], broker: &[Position]) -> Reconc
         broker_count: b.len(),
         missing_internal: mi,
         missing_broker: mb,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_reconcile_positions_matching_and_mismatches() {
+        let pos1 = Position::new("SPY260904C00500000", 2, 5.0, 5.5, Utc::now());
+        let pos2 = Position::new("QQQ260904P00400000", 1, 3.0, 3.2, Utc::now());
+
+        // Perfect match
+        let rep1 = reconcile_positions(std::slice::from_ref(&pos1), std::slice::from_ref(&pos1));
+        assert!(rep1.matched);
+        assert_eq!(rep1.internal_count, 1);
+        assert_eq!(rep1.broker_count, 1);
+
+        // Discrepancy in quantity
+        let mut pos1_diff = pos1.clone();
+        pos1_diff.qty = 3;
+        let rep2 = reconcile_positions(std::slice::from_ref(&pos1), &[pos1_diff]);
+        assert!(!rep2.matched);
+        assert_eq!(
+            rep2.missing_internal,
+            vec!["SPY260904C00500000".to_string()]
+        );
+
+        // Broker has extra position
+        let rep3 = reconcile_positions(std::slice::from_ref(&pos1), &[pos1.clone(), pos2.clone()]);
+        assert!(!rep3.matched);
+        assert_eq!(rep3.missing_broker, vec!["QQQ260904P00400000".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_paper_broker_order_lifecycle() {
+        let broker = PaperBroker::new(10_000.0);
+        let intent = OrderIntent {
+            client_order_id: Uuid::new_v4(),
+            symbol: "SPY260904C00500000".into(),
+            side: OrderSide::Buy,
+            qty: 2,
+            limit_price: Some(5.0),
+            reduce_only: false,
+            strategy_id: "strat1".into(),
+            created_at: Utc::now(),
+            order_hash: "hash".into(),
+            bot_id: None,
+            session_id: None,
+            decision_id: None,
+            oms_state: None,
+            option_action: None,
+        };
+
+        let submitted = broker.submit(&intent).await.expect("submit must succeed");
+        assert_eq!(submitted.client_order_id, intent.client_order_id);
+
+        let positions = broker.positions().await.expect("positions must succeed");
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].symbol, "SPY260904C00500000");
+        assert_eq!(positions[0].qty, 2);
     }
 }

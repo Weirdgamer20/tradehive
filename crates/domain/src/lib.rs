@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use uuid::Uuid;
+pub use uuid::Uuid;
 
 pub mod expiry_policy;
 pub mod market_session;
@@ -294,6 +294,40 @@ pub enum OrderSide {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OptionOrderAction {
+    BuyToOpen,
+    BuyToClose,
+    SellToOpen,
+    SellToClose,
+}
+
+impl OptionOrderAction {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::BuyToOpen => "buy_to_open",
+            Self::BuyToClose => "buy_to_close",
+            Self::SellToOpen => "sell_to_open",
+            Self::SellToClose => "sell_to_close",
+        }
+    }
+
+    pub fn order_side(&self) -> OrderSide {
+        match self {
+            Self::BuyToOpen | Self::BuyToClose => OrderSide::Buy,
+            Self::SellToOpen | Self::SellToClose => OrderSide::Sell,
+        }
+    }
+
+    pub fn is_opening(&self) -> bool {
+        matches!(self, Self::BuyToOpen | Self::SellToOpen)
+    }
+
+    pub fn is_closing(&self) -> bool {
+        matches!(self, Self::BuyToClose | Self::SellToClose)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OrderStatus {
     New,
     Accepted,
@@ -375,8 +409,22 @@ pub struct OrderIntent {
     pub decision_id: Option<Uuid>,
     #[serde(default)]
     pub oms_state: Option<OmsState>,
+    #[serde(default)]
+    pub option_action: Option<OptionOrderAction>,
 }
 impl OrderIntent {
+    pub fn resolve_option_action(&self) -> OptionOrderAction {
+        if let Some(action) = self.option_action {
+            return action;
+        }
+        match (self.side, self.reduce_only) {
+            (OrderSide::Buy, false) => OptionOrderAction::BuyToOpen,
+            (OrderSide::Buy, true) => OptionOrderAction::BuyToClose,
+            (OrderSide::Sell, false) => OptionOrderAction::SellToOpen,
+            (OrderSide::Sell, true) => OptionOrderAction::SellToClose,
+        }
+    }
+
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.qty == 0 {
             return Err(DomainError::Invalid("zero quantity".into()));
@@ -407,6 +455,262 @@ pub struct Fill {
     pub fee: f64,
     pub ts: DateTime<Utc>,
 }
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OptionContract {
+    pub symbol: String,
+    pub underlying: String,
+    pub strike: f64,
+    pub expiry: DateTime<Utc>,
+    pub option_type: OptionType,
+    pub multiplier: f64,
+    pub exchange: String,
+    pub currency: String,
+}
+
+impl OptionContract {
+    pub fn from_occ(symbol: &str) -> Option<Self> {
+        let parsed = occ::parse(symbol)?;
+        let naive_date =
+            chrono::NaiveDate::from_ymd_opt(parsed.year as i32, parsed.month, parsed.day)?;
+        let naive_dt = naive_date.and_hms_opt(20, 0, 0)?; // 4 PM ET expiration
+        let expiry = DateTime::from_naive_utc_and_offset(naive_dt, Utc);
+        Some(Self {
+            symbol: symbol.to_string(),
+            underlying: parsed.underlying,
+            strike: parsed.strike,
+            expiry,
+            option_type: parsed.option_type,
+            multiplier: CONTRACT_MULTIPLIER,
+            exchange: "OPRA".into(),
+            currency: "USD".into(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AssetClass {
+    Equity,
+    Option,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Quote {
+    pub symbol: String,
+    pub bid: f64,
+    pub ask: f64,
+    pub bid_size: u64,
+    pub ask_size: u64,
+    pub ts: DateTime<Utc>,
+    pub source: String,
+    pub feed: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TradeTick {
+    pub symbol: String,
+    pub price: f64,
+    pub size: u64,
+    pub ts: DateTime<Utc>,
+    pub conditions: Vec<String>,
+    pub exchange: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeatureSnapshot {
+    pub symbol: String,
+    pub as_of: DateTime<Utc>,
+    pub features: std::collections::HashMap<String, f64>,
+    pub quality: DataQualityStatus,
+    pub snapshot_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResearchRun {
+    pub run_id: String,
+    pub started_at: DateTime<Utc>,
+    pub ended_at: DateTime<Utc>,
+    pub dataset_hash: String,
+    pub total_trials: usize,
+    pub candidates_evaluated: usize,
+    pub candidates_promoted: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StrategyGenome {
+    pub genome_id: String,
+    pub strategy_id: String,
+    pub generation: u32,
+    pub parent_a: Option<String>,
+    pub parent_b: Option<String>,
+    pub mutation_type: String,
+    pub parameters: std::collections::HashMap<String, f64>,
+    pub genome_hash: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Candidate {
+    pub candidate_id: String,
+    pub genome: StrategyGenome,
+    pub symbol: String,
+    pub status: String,
+    pub score: f64,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvaluationResult {
+    pub candidate_id: String,
+    pub in_sample_sharpe: f64,
+    pub out_of_sample_sharpe: f64,
+    pub max_drawdown: f64,
+    pub win_rate: f64,
+    pub profit_factor: f64,
+    pub psr: f64,
+    pub dsr: f64,
+    pub pbo: f64,
+    pub promoted: bool,
+    pub rejection_reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortfolioDecision {
+    pub decision_id: Uuid,
+    pub session_id: String,
+    pub bot_id: String,
+    pub symbol: String,
+    pub target_exposure: f64,
+    pub allocated_capital: f64,
+    pub risk_budget: f64,
+    pub priority: u32,
+    pub decided_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RiskDecision {
+    pub decision_id: Uuid,
+    pub approved: bool,
+    pub reserved_capital: f64,
+    pub reason: String,
+    pub limits_checked: Vec<String>,
+    pub checked_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrderRecord {
+    pub client_order_id: Uuid,
+    pub broker_order_id: Option<String>,
+    pub symbol: String,
+    pub side: OrderSide,
+    pub qty: u32,
+    pub filled_qty: u32,
+    pub avg_fill_price: Option<f64>,
+    pub status: OrderStatus,
+    pub oms_state: OmsState,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionReport {
+    pub execution_id: String,
+    pub client_order_id: Uuid,
+    pub broker_order_id: String,
+    pub symbol: String,
+    pub side: OrderSide,
+    pub last_qty: u32,
+    pub last_price: f64,
+    pub cum_qty: u32,
+    pub leaves_qty: u32,
+    pub status: OrderStatus,
+    pub timestamp: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortfolioSnapshot {
+    pub as_of: DateTime<Utc>,
+    pub cash: f64,
+    pub equity: f64,
+    pub buying_power: f64,
+    pub gross_exposure: f64,
+    pub net_exposure: f64,
+    pub positions: Vec<Position>,
+    pub daily_realized: f64,
+    pub daily_unrealized: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReconciliationRecord {
+    pub session_id: String,
+    pub reconciled_at: DateTime<Utc>,
+    pub broker_positions_count: usize,
+    pub internal_positions_count: usize,
+    pub matched: bool,
+    pub discrepancies: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LearningExperience {
+    pub state_id: String,
+    pub action: String,
+    pub reward: f64,
+    pub next_state_id: String,
+    pub pnl: f64,
+    pub slippage: f64,
+    pub timestamp: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImprovementCandidate {
+    pub version: u32,
+    pub rationale: String,
+    pub proposed_changes: Vec<String>,
+    pub validation_status: String,
+    pub promoted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GovernanceDecision {
+    pub action: AuthorizationClass,
+    pub authorized: bool,
+    pub operator: String,
+    pub reason: String,
+    pub timestamp: DateTime<Utc>,
+}
+
+pub fn validate_point_in_time_event(
+    event_ts: DateTime<Utc>,
+    cutoff_ts: DateTime<Utc>,
+    price: f64,
+    bid: Option<f64>,
+    ask: Option<f64>,
+) -> Result<(), DomainError> {
+    if event_ts > cutoff_ts {
+        return Err(DomainError::Invalid(format!(
+            "Point-in-time violation: event_ts {} > cutoff_ts {}",
+            event_ts, cutoff_ts
+        )));
+    }
+    if !price.is_finite() || price <= 0.0 {
+        return Err(DomainError::Invalid(format!(
+            "Invalid non-positive price: {}",
+            price
+        )));
+    }
+    if let (Some(b), Some(a)) = (bid, ask) {
+        if !b.is_finite() || !a.is_finite() || b < 0.0 || a <= 0.0 {
+            return Err(DomainError::Invalid("Invalid bid/ask quote values".into()));
+        }
+        if b > a {
+            return Err(DomainError::Invalid(format!(
+                "Crossed market detected: bid {} > ask {}",
+                b, a
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Position {
     pub symbol: String,
@@ -414,10 +718,36 @@ pub struct Position {
     pub avg_price: f64,
     pub mark: f64,
     pub opened_at: DateTime<Utc>,
+    #[serde(default)]
+    pub contract: Option<OptionContract>,
 }
 impl Position {
+    pub fn new(
+        symbol: impl Into<String>,
+        qty: i32,
+        avg_price: f64,
+        mark: f64,
+        opened_at: DateTime<Utc>,
+    ) -> Self {
+        let sym = symbol.into();
+        let contract = OptionContract::from_occ(&sym);
+        Self {
+            symbol: sym,
+            qty,
+            avg_price,
+            mark,
+            opened_at,
+            contract,
+        }
+    }
+
     pub fn unrealized_pnl(&self) -> f64 {
-        (self.mark - self.avg_price) * self.qty as f64 * CONTRACT_MULTIPLIER
+        let mult = self
+            .contract
+            .as_ref()
+            .map(|c| c.multiplier)
+            .unwrap_or(CONTRACT_MULTIPLIER);
+        (self.mark - self.avg_price) * self.qty as f64 * mult
     }
 }
 
@@ -747,5 +1077,118 @@ pub mod occ {
             option_type,
             strike,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_occ_parsing_and_contract_generation() {
+        let sym = "SPY260904C00500000";
+        let parsed = occ::parse(sym).expect("must parse standard OCC");
+        assert_eq!(parsed.underlying, "SPY");
+        assert_eq!(parsed.year, 2026);
+        assert_eq!(parsed.month, 9);
+        assert_eq!(parsed.day, 4);
+        assert_eq!(parsed.option_type, OptionType::Call);
+        assert_eq!(parsed.strike, 500.0);
+
+        let contract = OptionContract::from_occ(sym).expect("must generate OptionContract");
+        assert_eq!(contract.underlying, "SPY");
+        assert_eq!(contract.strike, 500.0);
+        assert_eq!(contract.multiplier, 100.0);
+        assert_eq!(contract.option_type, OptionType::Call);
+
+        let pos = Position::new(sym, 2, 5.0, 6.0, Utc::now());
+        assert_eq!(pos.unrealized_pnl(), (6.0 - 5.0) * 2.0 * 100.0);
+    }
+
+    #[test]
+    fn test_point_in_time_event_validation() {
+        let now = Utc::now();
+        let past = now - chrono::Duration::minutes(5);
+        let future = now + chrono::Duration::minutes(5);
+
+        // Valid past event
+        assert!(validate_point_in_time_event(past, now, 100.0, Some(99.5), Some(100.5)).is_ok());
+
+        // Future timestamp violation
+        assert!(validate_point_in_time_event(future, now, 100.0, Some(99.5), Some(100.5)).is_err());
+
+        // Negative price violation
+        assert!(validate_point_in_time_event(past, now, -10.0, None, None).is_err());
+
+        // Crossed market violation
+        assert!(validate_point_in_time_event(past, now, 100.0, Some(101.0), Some(99.0)).is_err());
+    }
+
+    #[test]
+    fn test_option_order_action_mapping() {
+        let bto = OptionOrderAction::BuyToOpen;
+        assert_eq!(bto.as_str(), "buy_to_open");
+        assert_eq!(bto.order_side(), OrderSide::Buy);
+        assert!(bto.is_opening());
+        assert!(!bto.is_closing());
+
+        let stc = OptionOrderAction::SellToClose;
+        assert_eq!(stc.as_str(), "sell_to_close");
+        assert_eq!(stc.order_side(), OrderSide::Sell);
+        assert!(!stc.is_opening());
+        assert!(stc.is_closing());
+
+        let intent_open = OrderIntent {
+            client_order_id: Uuid::new_v4(),
+            symbol: "SPY260904C00500000".into(),
+            side: OrderSide::Buy,
+            qty: 1,
+            limit_price: Some(5.0),
+            reduce_only: false,
+            strategy_id: "strat1".into(),
+            created_at: Utc::now(),
+            order_hash: "hash".into(),
+            bot_id: None,
+            session_id: None,
+            decision_id: None,
+            oms_state: None,
+            option_action: None,
+        };
+        assert_eq!(
+            intent_open.resolve_option_action(),
+            OptionOrderAction::BuyToOpen
+        );
+
+        let intent_close = OrderIntent {
+            reduce_only: true,
+            ..intent_open
+        };
+        assert_eq!(
+            intent_close.resolve_option_action(),
+            OptionOrderAction::BuyToClose
+        );
+    }
+
+    #[test]
+    fn test_black_scholes_pricing_and_greeks() {
+        let spot = 100.0;
+        let strike = 100.0;
+        let t = 30.0 / 365.0;
+        let r = 0.05;
+        let sigma = 0.20;
+
+        let call_price = black_scholes::price(spot, strike, t, r, sigma, OptionType::Call).unwrap();
+        let put_price = black_scholes::price(spot, strike, t, r, sigma, OptionType::Put).unwrap();
+        assert!(call_price > 0.0);
+        assert!(put_price > 0.0);
+
+        let call_greeks =
+            black_scholes::greeks(spot, strike, t, r, sigma, OptionType::Call).unwrap();
+        assert!(call_greeks.delta > 0.45 && call_greeks.delta < 0.65);
+        assert!(call_greeks.gamma > 0.0);
+        assert!(call_greeks.vega > 0.0);
+
+        let put_greeks = black_scholes::greeks(spot, strike, t, r, sigma, OptionType::Put).unwrap();
+        assert!(put_greeks.delta < 0.0 && put_greeks.delta > -1.0);
     }
 }

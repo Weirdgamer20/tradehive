@@ -376,3 +376,89 @@ impl CapitalAuthority {
         self.allocations.get(bot_id)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use th_domain::OrderSide;
+
+    #[test]
+    fn test_risk_limits_enforcement() {
+        let limits = RiskLimits {
+            max_order_notional: 500.0,
+            max_total_notional: 2000.0,
+            max_daily_loss: 100.0,
+            max_positions: 5,
+            max_single_position_qty: 5,
+            max_spread_bps: 100.0,
+            max_symbol_exposure: 1000.0,
+            max_trade_risk_pct: 0.05,
+            max_portfolio_risk_pct: 0.10,
+        };
+        let mut gov = RiskGovernor::new(limits);
+
+        let valid_order = OrderIntent {
+            client_order_id: Uuid::new_v4(),
+            symbol: "SPY260904C00500000".into(),
+            side: OrderSide::Buy,
+            qty: 1,
+            limit_price: Some(4.0),
+            reduce_only: false,
+            strategy_id: "s1".into(),
+            created_at: Utc::now(),
+            order_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            bot_id: None,
+            session_id: None,
+            decision_id: None,
+            oms_state: None,
+            option_action: None,
+        };
+        let normal_portfolio = PortfolioRisk {
+            cash: 10_000.0,
+            realized_today: 0.0,
+            positions: vec![],
+        };
+        assert!(gov
+            .authorize(&valid_order, 4.0, 50.0, &normal_portfolio)
+            .is_ok());
+
+        // Breaching single order qty limit
+        let breaching_qty = OrderIntent {
+            qty: 10, // Max single position qty is 5
+            ..valid_order.clone()
+        };
+        assert!(gov
+            .authorize(&breaching_qty, 4.0, 50.0, &normal_portfolio)
+            .is_err());
+
+        // Daily loss breach prevents authorization
+        let loss_portfolio = PortfolioRisk {
+            cash: 10_000.0,
+            realized_today: -150.0, // Exceeds max_daily_loss 100.0
+            positions: vec![],
+        };
+        assert!(gov
+            .authorize(&valid_order, 4.0, 50.0, &loss_portfolio)
+            .is_err());
+    }
+
+    #[test]
+    fn test_capital_authority_reservations() {
+        let mut auth = CapitalAuthority::new(10_000.0);
+        assert_eq!(auth.available(), 10_000.0);
+
+        // Reserve 3,000 for bot-1
+        auth.reserve("bot-1", 3000.0)
+            .expect("reservation must succeed");
+        assert_eq!(auth.reserved(), 3000.0);
+        assert_eq!(auth.available(), 7000.0);
+
+        // Exceeding reservation must fail
+        assert!(auth.reserve("bot-2", 8000.0).is_err());
+
+        // Release bot-1
+        auth.release("bot-1");
+        assert_eq!(auth.reserved(), 0.0);
+        assert_eq!(auth.available(), 10_000.0);
+    }
+}

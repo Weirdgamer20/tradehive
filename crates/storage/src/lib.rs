@@ -850,6 +850,7 @@ mod tests {
             session_id: None,
             decision_id: None,
             oms_state: None,
+            option_action: None,
         };
         assert!(s.reserve_order(&o).unwrap());
         assert!(!s.reserve_order(&o).unwrap());

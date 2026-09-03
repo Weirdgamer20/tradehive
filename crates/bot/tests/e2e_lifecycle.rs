@@ -101,6 +101,7 @@ async fn test_complete_e2e_paper_lifecycle() {
         avg_price: 5.0,
         mark: 5.5,
         opened_at: now,
+        contract: th_domain::OptionContract::from_occ(option_symbol),
     });
 
     // 4. Market Closing & Mandatory EOD Flatten
