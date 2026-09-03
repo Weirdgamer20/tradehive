@@ -23,6 +23,9 @@ use uuid::Uuid;
 pub mod sizing;
 pub use sizing::*;
 
+pub mod supervisor;
+pub use supervisor::*;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeConfig {
     pub analysis_start_hour: u32,
@@ -2773,8 +2776,9 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
         Ok(self.stats.clone())
     }
 
-    pub async fn run_forever(&mut self, symbols: &[String]) -> Result<(), RuntimeError> {
-        self.run_session(symbols, None).await.map(|_| ())
+    pub async fn run_forever(&mut self, _symbols: &[String]) -> Result<(), RuntimeError> {
+        let mut supervisor = HiveSupervisor::new(self, SupervisorConfig::default());
+        supervisor.run_supervised(None).await
     }
 }
 

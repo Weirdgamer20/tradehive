@@ -580,6 +580,27 @@ impl Store {
         ))
     }
 
+    pub fn save_checkpoint(&self, name: &str, value: &str) -> Result<(), StorageError> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT OR REPLACE INTO checkpoints(name, value, updated_at) VALUES(?, ?, ?)",
+            params![name, value, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_checkpoint(&self, name: &str) -> Result<Option<String>, StorageError> {
+        let mut st = self
+            .conn
+            .prepare("SELECT value FROM checkpoints WHERE name=?")?;
+        let mut rows = st.query(params![name])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row.get(0)?))
+        } else {
+            Ok(None)
+        }
+    }
+
     pub fn record_generation(&self, g: &HiveGenerationRecord) -> Result<(), StorageError> {
         self.conn.execute(
             "INSERT OR REPLACE INTO hive_generations(generation_id,created_at,status,total_capital,bots_count,metadata) VALUES(?,?,?,?,?,?)",

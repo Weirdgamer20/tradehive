@@ -1,17 +1,19 @@
 [Unit]
-Description=TradingHive Rust Trading Runtime
+Description=TradingHive Autonomous 24/7 Trading Supervisor
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+Type=notify
 User=tradinghive
 Group=tradinghive
 WorkingDirectory=/opt/trading-hive
 EnvironmentFile=/etc/trading-hive/production.env
-ExecStart=/opt/trading-hive/bin/trading-hive live-paper --symbols SPY,QQQ
-Restart=on-failure
-RestartSec=5
+ExecStart=/opt/trading-hive/bin/trading-hive live-paper
+Restart=always
+RestartSec=10
+WatchdogSec=30
+KillSignal=SIGTERM
 TimeoutStopSec=30
 NoNewPrivileges=true
 PrivateTmp=true

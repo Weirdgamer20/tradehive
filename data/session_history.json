@@ -1,0 +1,28 @@
+[
+  {
+    "account_cash": 999058.44,
+    "account_equity": 999058.44,
+    "bot_count": 0,
+    "market_date": "2026-09-03",
+    "open_trades": 0,
+    "realized_pnl": 0.0,
+    "rejected_orders": 0,
+    "session_id": "SESSION-20260903",
+    "status": "FINALIZED",
+    "symbols": [
+      "NVD",
+      "BITO",
+      "TSLG",
+      "TSLL",
+      "NVDA",
+      "GPRO",
+      "NU",
+      "NOK",
+      "IBIT",
+      "SPCX"
+    ],
+    "timestamp": "2026-09-03T20:22:52.395778100+00:00",
+    "trades_closed": 0,
+    "trades_opened": 0
+  }
+]
