@@ -112,12 +112,18 @@ async fn run_autonomous(max_ticks: Option<usize>) -> Result<(), Box<dyn std::err
     );
 
     let mut runtime = TradingRuntime::new(cfg, broker, provider)?;
-    match max_ticks {
-        Some(n) => {
-            runtime.run_session(&[], Some(n)).await?;
+
+    let mut supervisor = th_bot::HiveSupervisor::new(&mut runtime, th_bot::SupervisorConfig::default());
+    supervisor.initialize_and_recover().await
+        .map_err(|e| format!("SUPERVISOR_INIT_FAILED: {e}"))?;
+
+    tokio::select! {
+        res = supervisor.run_supervised(max_ticks) => {
+            res.map_err(|e| format!("SUPERVISOR_ERROR: {e}"))?;
         }
-        None => {
-            runtime.run_forever(&[]).await?;
+        _ = tokio::signal::ctrl_c() => {
+            println!("SHUTDOWN_SIGNAL_RECEIVED initiating_graceful_shutdown");
+            supervisor.step_shutdown().await;
         }
     }
     Ok(())

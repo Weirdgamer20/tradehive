@@ -160,14 +160,13 @@ impl WatchdogNotifier {
     }
 
     fn send(&self, _msg: &str) {
-        if !self.enabled {
-            return;
-        }
-        #[cfg(unix)]
-        {
-            if let Ok(path) = std::env::var("NOTIFY_SOCKET") {
-                if let Ok(socket) = std::os::unix::net::UnixDatagram::unbound() {
-                    let _ = socket.send_to(_msg.as_bytes(), path);
+        if self.enabled {
+            #[cfg(unix)]
+            {
+                if let Ok(path) = std::env::var("NOTIFY_SOCKET") {
+                    if let Ok(socket) = std::os::unix::net::UnixDatagram::unbound() {
+                        let _ = socket.send_to(_msg.as_bytes(), path);
+                    }
                 }
             }
         }
@@ -181,7 +180,7 @@ pub struct HiveSupervisor<'a, B: th_execution::Broker, P: th_market_data::Market
     pub checkpoint: SupervisorCheckpoint,
     pub watchdog: WatchdogNotifier,
     last_heartbeat: Instant,
-    last_progress: Instant,
+    pub last_progress: Instant,
     pub retry_count: u32,
     pub halt_reason: Option<String>,
     should_stop: bool,
@@ -221,6 +220,10 @@ impl<'a, B: th_execution::Broker, P: th_market_data::MarketDataProvider> HiveSup
             self.state = next;
             self.checkpoint.supervisor_state = next;
             self.checkpoint.last_transition_time = Utc::now();
+            // Reset progress clock on every transition so we don't immediately
+            // stall-detect in the new state.
+            self.last_progress = Instant::now();
+            self.checkpoint.last_successful_progress = Utc::now();
             if next == SupervisorState::Halted && self.checkpoint.last_error.is_none() {
                 self.checkpoint.last_error = self.halt_reason.clone();
             }
@@ -319,7 +322,26 @@ impl<'a, B: th_execution::Broker, P: th_market_data::MarketDataProvider> HiveSup
             return;
         }
         self.last_heartbeat = Instant::now();
-        self.watchdog.notify_watchdog();
+
+        // Stall detection: if we have been in Trading for more than 4× the
+        // operation_timeout without any domain progress, the runtime is stuck.
+        // Withhold the watchdog notification so systemd eventually restarts us.
+        let stall_timeout = self.config.operation_timeout * 4;
+        let is_stalled = self.state == SupervisorState::Trading
+            && self.last_progress.elapsed() > stall_timeout;
+
+        if is_stalled {
+            println!(
+                "RUNTIME_STALLED elapsed_secs={} — withholding watchdog",
+                self.last_progress.elapsed().as_secs()
+            );
+            self.checkpoint.last_error = Some("runtime_stalled_in_trading".into());
+            self.retry_count += 1;
+            self.transition_to(SupervisorState::Recovering, "runtime_stalled");
+            // Do NOT call notify_watchdog() — let systemd expire and restart us.
+        } else {
+            self.watchdog.notify_watchdog();
+        }
 
         let session_id = self.runtime.current_session_id.as_deref().unwrap_or("NONE");
         let market_open = self.runtime.market_clock.is_open(now);
@@ -598,6 +620,10 @@ impl<'a, B: th_execution::Broker, P: th_market_data::MarketDataProvider> HiveSup
                     self.runtime.stats.realized_pnl
                 );
 
+                // Record domain progress so the stall watchdog stays satisfied.
+                self.last_progress = Instant::now();
+                self.checkpoint.last_successful_progress = Utc::now();
+
                 *tick_count += 1;
                 if let Some(max) = max_ticks {
                     if *tick_count >= max {
@@ -615,17 +641,26 @@ impl<'a, B: th_execution::Broker, P: th_market_data::MarketDataProvider> HiveSup
                 println!("SESSION_FINALIZATION_STARTED session_id={}", session_id);
                 self.runtime.active = false;
 
-                // Flatten all open positions
+                // Flatten all open positions — fail-closed on error.
                 if let Err(e) = self.runtime.execute_market_closing(&session_id).await {
                     println!("MARKET_CLOSING_ERROR error={}", e);
+                    self.checkpoint.last_error = Some(e.to_string());
+                    self.retry_count += 1;
+                    self.transition_to(SupervisorState::Recovering, "market_closing_failed");
+                    return Ok(());
                 }
 
-                // Post-market reconciliation
+                // Post-market reconciliation — fail-closed on error.
                 let active_symbols = self.runtime.active_universe.clone();
                 if let Err(e) = self.runtime.execute_post_market(&session_id, &active_symbols, now).await {
                     println!("POST_MARKET_ERROR error={}", e);
+                    self.checkpoint.last_error = Some(e.to_string());
+                    self.retry_count += 1;
+                    self.transition_to(SupervisorState::Recovering, "post_market_failed");
+                    return Ok(());
                 }
 
+                // Both steps succeeded — safe to declare the session complete.
                 println!("SESSION_FINALIZED session_id={}", session_id);
                 self.transition_to(SupervisorState::Learning, "session_finalized_ready_for_learning");
             }

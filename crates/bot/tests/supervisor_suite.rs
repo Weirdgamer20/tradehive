@@ -586,3 +586,99 @@ async fn test_supervisor_automatic_universe_and_session_binding() {
     let _ = std::fs::remove_file(&db);
 }
 
+
+// ---------------------------------------------------------------------------
+// New tests: stall detection and finalization fail-closed behaviour
+// ---------------------------------------------------------------------------
+
+/// Verify that stall detection in `emit_heartbeat` withholds the watchdog and
+/// transitions the supervisor from Trading to Recovering.
+///
+/// Uses a 1ms `operation_timeout` so 4x the timeout is trivially exceeded.
+/// `last_progress` is backdated 600s into the past to guarantee the stall
+/// fires on the very first heartbeat.
+#[tokio::test]
+async fn test_supervisor_stall_detection_withholds_watchdog_and_recovers() {
+    let (mut runtime, db) = create_test_runtime();
+    let config = SupervisorConfig {
+        operation_timeout: Duration::from_millis(1),
+        heartbeat_interval: Duration::from_millis(0),
+        ..SupervisorConfig::default()
+    };
+    let mut supervisor = HiveSupervisor::new(&mut runtime, config);
+
+    supervisor.state = SupervisorState::Trading;
+    supervisor.runtime.active = true;
+
+    // Backdate last_progress far beyond 4 x 1 ms.
+    supervisor.last_progress = std::time::Instant::now()
+        - Duration::from_secs(600);
+
+    let retry_before = supervisor.retry_count;
+    supervisor.emit_heartbeat(Utc::now());
+
+    assert_eq!(
+        supervisor.state,
+        SupervisorState::Recovering,
+        "stall detection must transition Trading -> Recovering"
+    );
+    assert!(
+        supervisor.retry_count > retry_before,
+        "stall detection must increment retry_count"
+    );
+    assert_eq!(
+        supervisor.checkpoint.last_error.as_deref(),
+        Some("runtime_stalled_in_trading"),
+        "checkpoint must record the stall reason"
+    );
+
+    let _ = std::fs::remove_file(&db);
+}
+
+/// Verify FinalizingSession is fail-closed: when execute_market_closing errors
+/// (real FailingProvider + seeded OpenTrade), supervisor moves to Recovering
+/// without ever reaching Learning.
+#[tokio::test]
+async fn test_supervisor_finalization_failure_transitions_to_recovering() {
+    let (mut runtime, db) = create_test_runtime_failing();
+    let config = SupervisorConfig::default();
+
+    // Seed an open trade so execute_market_closing calls option_chain, which
+    // FailingProvider always rejects.
+    runtime.open_trades.insert(
+        "SPY-test-key".into(),
+        th_bot::OpenTrade {
+            symbol: "SPY230915C00450000".into(),
+            underlying: "SPY".into(),
+            strategy_id: "test_strategy".into(),
+            entry_price: 5.0,
+            entry_ts: Utc::now(),
+            stop_loss_pct: 0.05,
+            take_profit_pct: 0.10,
+            qty: 1,
+        },
+    );
+
+    let mut supervisor = HiveSupervisor::new(&mut runtime, config);
+    supervisor.state = SupervisorState::FinalizingSession;
+    supervisor.runtime.current_session_id = Some("SESSION-FAIL-TEST".into());
+
+    let mut tick_count = 0usize;
+    supervisor.step(None, &mut tick_count).await.unwrap();
+
+    assert_eq!(
+        supervisor.state,
+        SupervisorState::Recovering,
+        "market_closing failure must transition to Recovering, not Learning"
+    );
+    assert!(
+        supervisor.checkpoint.last_error.is_some(),
+        "checkpoint must record the closing error"
+    );
+    assert!(
+        supervisor.retry_count > 0,
+        "retry_count must be incremented on finalization failure"
+    );
+
+    let _ = std::fs::remove_file(&db);
+}
