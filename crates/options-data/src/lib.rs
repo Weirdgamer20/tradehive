@@ -15,6 +15,8 @@ pub struct OptionQuote {
     pub volume: u64,
     pub open_interest: u64,
     pub iv: Option<f64>,
+    #[serde(default)]
+    pub greeks: Option<OptionGreeks>,
     pub as_of: DateTime<Utc>,
 }
 impl OptionQuote {
@@ -167,26 +169,19 @@ impl OptionRankingPipeline {
                 continue;
             }
 
-            // Step 8-12: Greeks evaluation
-            let dte_years = (dte_mins as f64 / 525_600.0).max(1e-6);
-            let iv = q.iv.unwrap_or(0.25).clamp(0.05, 3.0);
-            let greeks = th_domain::black_scholes::greeks(
-                chain.spot,
-                q.strike,
-                dte_years,
-                0.04,
-                iv,
-                target_type,
-            )
-            .map(|g| OptionGreeks {
-                delta: g.delta,
-                gamma: g.gamma,
-                theta: g.theta,
-                vega: g.vega,
-                rho: g.rho,
-            });
+            // Step 8-12: Greeks & IV validation - STRICT REAL DATA ONLY
+            let Some(iv) = q.iv else {
+                continue;
+            };
+            if !iv.is_finite() || iv <= 0.0 {
+                continue;
+            }
 
-            let delta = greeks.as_ref().map(|g| g.delta.abs()).unwrap_or(0.50);
+            let greeks = q.greeks.clone();
+            let delta = greeks
+                .as_ref()
+                .map(|g| g.delta.abs())
+                .unwrap_or(self.config.target_delta);
 
             // Step 13-16: Scored factors
             let delta_fit = 1.0 - (delta - self.config.target_delta).abs() * 2.0;

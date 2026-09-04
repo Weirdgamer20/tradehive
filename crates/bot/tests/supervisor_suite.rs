@@ -6,7 +6,7 @@ use th_bot::{
 };
 use th_domain::{Bar, HolidayCalendar, MarketSessionClock, OptionChain};
 use th_execution::PaperBroker;
-use th_market_data::{MarketDataError, MarketDataProvider, NewsEvent, SyntheticProvider};
+use th_market_data::{MarketDataError, MarketDataProvider, NewsEvent};
 use uuid::Uuid;
 
 fn set_test_env() {
@@ -27,7 +27,106 @@ fn set_test_env() {
     std::env::set_var("HIVE_RISK_FRACTION", "0.02");
 }
 
-fn create_test_runtime() -> (TradingRuntime<PaperBroker, SyntheticProvider>, String) {
+#[derive(Clone, Default)]
+struct StubMarketDataProvider {
+    pub active_symbols: Vec<String>,
+}
+
+#[async_trait::async_trait]
+impl MarketDataProvider for StubMarketDataProvider {
+    async fn most_actives(&self, _limit: usize) -> Result<Vec<String>, MarketDataError> {
+        if self.active_symbols.is_empty() {
+            Ok(vec!["SPY".into()])
+        } else {
+            Ok(self.active_symbols.clone())
+        }
+    }
+    async fn bars(
+        &self,
+        symbol: &str,
+        start: chrono::DateTime<Utc>,
+        _end: chrono::DateTime<Utc>,
+    ) -> Result<Vec<Bar>, MarketDataError> {
+        let mut bars = Vec::new();
+        for i in 0..60 {
+            bars.push(Bar {
+                symbol: symbol.into(),
+                ts: start + chrono::Duration::minutes(5 * i as i64),
+                open: 500.0 + (i as f64 * 0.1),
+                high: 501.0 + (i as f64 * 0.1),
+                low: 499.0 + (i as f64 * 0.1),
+                close: 500.5 + (i as f64 * 0.1),
+                volume: 1000.0,
+            });
+        }
+        Ok(bars)
+    }
+    async fn option_chain(
+        &self,
+        underlying: &str,
+        as_of: chrono::DateTime<Utc>,
+    ) -> Result<OptionChain, MarketDataError> {
+        let expiry = as_of + chrono::Duration::hours(24);
+        Ok(OptionChain {
+            underlying: underlying.into(),
+            as_of,
+            quotes: vec![
+                th_domain::OptionQuote {
+                    symbol: format!("{}-500-0", underlying),
+                    underlying: underlying.into(),
+                    option_type: th_domain::OptionType::Call,
+                    strike: 500.0,
+                    expiry,
+                    bid: 4.90,
+                    ask: 5.10,
+                    last: 5.00,
+                    iv: 0.20,
+                    greeks: Some(th_domain::Greeks {
+                        delta: 0.50,
+                        gamma: 0.02,
+                        theta: -0.02,
+                        vega: 0.10,
+                        rho: 0.01,
+                    }),
+                    open_interest: 1000,
+                    volume: 500,
+                    quote_ts: as_of,
+                },
+                th_domain::OptionQuote {
+                    symbol: format!("{}-500-1", underlying),
+                    underlying: underlying.into(),
+                    option_type: th_domain::OptionType::Put,
+                    strike: 500.0,
+                    expiry,
+                    bid: 4.90,
+                    ask: 5.10,
+                    last: 5.00,
+                    iv: 0.20,
+                    greeks: Some(th_domain::Greeks {
+                        delta: -0.50,
+                        gamma: 0.02,
+                        theta: -0.02,
+                        vega: 0.10,
+                        rho: 0.01,
+                    }),
+                    open_interest: 1000,
+                    volume: 500,
+                    quote_ts: as_of,
+                },
+            ],
+        })
+    }
+    async fn news(
+        &self,
+        _symbol: &str,
+        _start: chrono::DateTime<Utc>,
+        _end: chrono::DateTime<Utc>,
+    ) -> Result<Vec<NewsEvent>, MarketDataError> {
+        Ok(vec![])
+    }
+}
+
+fn create_test_runtime() -> (TradingRuntime<PaperBroker, StubMarketDataProvider>, String) {
     let (runtime, _broker, db) = create_test_runtime_with_broker();
     (runtime, db)
 }
@@ -43,12 +142,22 @@ impl MarketDataProvider for FailingProvider {
     async fn bars(
         &self,
         symbol: &str,
-        _start: chrono::DateTime<Utc>,
+        start: chrono::DateTime<Utc>,
         _end: chrono::DateTime<Utc>,
     ) -> Result<Vec<Bar>, MarketDataError> {
-        // Return enough bars so that if most_actives somehow succeeded the
-        // bars path would not itself be the failure point.
-        SyntheticProvider.bars(symbol, _start, _end).await
+        let mut bars = Vec::new();
+        for i in 0..60 {
+            bars.push(Bar {
+                symbol: symbol.into(),
+                ts: start + chrono::Duration::minutes(5 * i as i64),
+                open: 500.0 + (i as f64 * 0.1),
+                high: 501.0 + (i as f64 * 0.1),
+                low: 499.0 + (i as f64 * 0.1),
+                close: 500.5 + (i as f64 * 0.1),
+                volume: 1000.0,
+            });
+        }
+        Ok(bars)
     }
     async fn option_chain(
         &self,
@@ -100,7 +209,7 @@ fn create_test_runtime_failing() -> (TradingRuntime<PaperBroker, FailingProvider
 }
 
 fn create_test_runtime_with_broker() -> (
-    TradingRuntime<PaperBroker, SyntheticProvider>,
+    TradingRuntime<PaperBroker, StubMarketDataProvider>,
     PaperBroker,
     String,
 ) {
@@ -113,7 +222,7 @@ fn create_test_runtime_with_broker() -> (
     std::env::set_var("TRADING_HIVE_HISTORY_DIR", &hist_dir);
 
     let broker = PaperBroker::new(100_000.0);
-    let provider = SyntheticProvider;
+    let provider = StubMarketDataProvider::default();
 
     let runtime = TradingRuntime::new(
         RuntimeConfig {
@@ -816,8 +925,10 @@ impl th_execution::Broker for FailingBroker {
     }
 }
 
-fn create_test_runtime_with_failing_broker(
-) -> (TradingRuntime<FailingBroker, SyntheticProvider>, String) {
+fn create_test_runtime_with_failing_broker() -> (
+    TradingRuntime<FailingBroker, StubMarketDataProvider>,
+    String,
+) {
     set_test_env();
     let db = format!("target/test_supervisor_{}.sqlite", Uuid::new_v4());
     let _ = std::fs::remove_file(&db);
@@ -827,7 +938,7 @@ fn create_test_runtime_with_failing_broker(
     std::env::set_var("TRADING_HIVE_HISTORY_DIR", &hist_dir);
 
     let broker = FailingBroker;
-    let provider = SyntheticProvider;
+    let provider = StubMarketDataProvider::default();
 
     let runtime = TradingRuntime::new(
         RuntimeConfig {

@@ -394,24 +394,10 @@ pub fn calculate_comprehensive_stats(
     }
 }
 
-/// Computes Black-Scholes option price for synthetic or quote-less backtesting
-fn option_mark_bs(
-    spot: f64,
-    strike: f64,
-    remaining_days: f64,
-    iv: f64,
-    r: f64,
-    ty: OptionType,
-) -> f64 {
-    th_domain::black_scholes::price(spot, strike, (remaining_days / 365.0).max(1e-6), r, iv, ty)
-        .unwrap_or(0.0)
-}
-
 #[derive(Debug, Clone)]
 struct OpenOptionPosition {
     side: SignalSide,
     entry_px: f64,
-    strike: f64,
     ets: i64,
     ei: usize,
     entry_slip: f64,
@@ -434,6 +420,8 @@ impl OptionBacktestEngine {
         strategy: &mut dyn Strategy,
         bars: &[Bar],
     ) -> Result<BacktestReport, BacktestError> {
+        // Hard invariant: Option backtesting requires real option quotes.
+        // For underlying-only backtesting, use UnderlyingBacktestEngine.
         self.run_with_quotes(strategy, bars, None)
     }
 
@@ -454,11 +442,14 @@ impl OptionBacktestEngine {
         if bars.len() < strategy.spec().warmup + 3 {
             return Err(BacktestError::InsufficientData);
         }
+        let Some(q_map) = quotes_map else {
+            // Hard invariant: NO SYNTHETIC OPTION PRICING FALLBACK. Real quotes are required.
+            return Err(BacktestError::InsufficientData);
+        };
 
         let mut trades = Vec::new();
         let mut open: Option<OpenOptionPosition> = None;
         let mut pending: Option<(SignalSide, usize)> = None;
-        let dte_days = 7.0; // Benchmark 7-day DTE option
 
         for i in 0..bars.len() {
             let bar = &bars[i];
@@ -475,62 +466,18 @@ impl OptionBacktestEngine {
                         SignalSide::Flat => OptionType::Call,
                     };
 
-                    let (exit_px, exit_slip, exit_spread) = if let Some(q_map) = quotes_map {
-                        if let Some(quotes) = q_map.get(&bar_ts) {
-                            if let Some(q) = quotes.iter().find(|q| q.option_type == ty) {
-                                let slip = q.bid * self.cfg.slippage_bps / 10_000.0;
-                                (q.bid - slip, slip, q.spread())
-                            } else {
-                                self.compute_bs_exit(bar.open, pos.strike, bars_held, dte_days, ty)
-                            }
-                        } else {
-                            self.compute_bs_exit(bar.open, pos.strike, bars_held, dte_days, ty)
-                        }
-                    } else {
-                        self.compute_bs_exit(bar.open, pos.strike, bars_held, dte_days, ty)
-                    };
+                    if let Some(quotes) = q_map.get(&bar_ts) {
+                        if let Some(q) = quotes.iter().find(|q| q.option_type == ty) {
+                            let slip = q.bid * self.cfg.slippage_bps / 10_000.0;
+                            let exit_px = q.bid - slip;
+                            let exit_slip = slip;
+                            let exit_spread = q.spread();
 
-                    let fees = (pos.entry_px + exit_px)
-                        * self.cfg.multiplier
-                        * (self.cfg.fee_bps / 10_000.0);
-                    let pnl = (exit_px - pos.entry_px) * self.cfg.multiplier - fees;
-
-                    trades.push(TradeResult {
-                        entry_ts: pos.ets,
-                        exit_ts: bar_ts,
-                        side: pos.side,
-                        entry: pos.entry_px,
-                        exit: exit_px,
-                        pnl,
-                        slippage_incurred: (pos.entry_slip + exit_slip) * self.cfg.multiplier,
-                        spread_cost: (pos.entry_spread + exit_spread) * self.cfg.multiplier,
-                        fees_paid: fees,
-                        bars_held,
-                        contract_symbol: pos.opt_sym,
-                    });
-                } else {
-                    open = Some(pos);
-                }
-            }
-
-            // 2. Process pending entries
-            if let Some((side, signal_bar)) = pending {
-                if i >= signal_bar + self.cfg.latency_bars.max(1) {
-                    pending = None;
-                    if let Some(pos) = open.take() {
-                        if pos.side != side {
-                            let ty = match pos.side {
-                                SignalSide::LongCall => OptionType::Call,
-                                SignalSide::LongPut => OptionType::Put,
-                                SignalSide::Flat => OptionType::Call,
-                            };
-                            let bars_held = i.saturating_sub(pos.ei);
-                            let (exit_px, exit_slip, exit_spread) =
-                                self.compute_bs_exit(bar.open, pos.strike, bars_held, dte_days, ty);
                             let fees = (pos.entry_px + exit_px)
                                 * self.cfg.multiplier
                                 * (self.cfg.fee_bps / 10_000.0);
                             let pnl = (exit_px - pos.entry_px) * self.cfg.multiplier - fees;
+
                             trades.push(TradeResult {
                                 entry_ts: pos.ets,
                                 exit_ts: bar_ts,
@@ -548,6 +495,61 @@ impl OptionBacktestEngine {
                         } else {
                             open = Some(pos);
                         }
+                    } else {
+                        open = Some(pos);
+                    }
+                } else {
+                    open = Some(pos);
+                }
+            }
+
+            // 2. Process pending entries
+            if let Some((side, signal_bar)) = pending {
+                if i >= signal_bar + self.cfg.latency_bars.max(1) {
+                    pending = None;
+                    if let Some(pos) = open.take() {
+                        if pos.side != side {
+                            let ty = match pos.side {
+                                SignalSide::LongCall => OptionType::Call,
+                                SignalSide::LongPut => OptionType::Put,
+                                SignalSide::Flat => OptionType::Call,
+                            };
+                            let bars_held = i.saturating_sub(pos.ei);
+                            if let Some(quotes) = q_map.get(&bar_ts) {
+                                if let Some(q) = quotes.iter().find(|q| q.option_type == ty) {
+                                    let slip = q.bid * self.cfg.slippage_bps / 10_000.0;
+                                    let exit_px = q.bid - slip;
+                                    let exit_slip = slip;
+                                    let exit_spread = q.spread();
+
+                                    let fees = (pos.entry_px + exit_px)
+                                        * self.cfg.multiplier
+                                        * (self.cfg.fee_bps / 10_000.0);
+                                    let pnl = (exit_px - pos.entry_px) * self.cfg.multiplier - fees;
+                                    trades.push(TradeResult {
+                                        entry_ts: pos.ets,
+                                        exit_ts: bar_ts,
+                                        side: pos.side,
+                                        entry: pos.entry_px,
+                                        exit: exit_px,
+                                        pnl,
+                                        slippage_incurred: (pos.entry_slip + exit_slip)
+                                            * self.cfg.multiplier,
+                                        spread_cost: (pos.entry_spread + exit_spread)
+                                            * self.cfg.multiplier,
+                                        fees_paid: fees,
+                                        bars_held,
+                                        contract_symbol: pos.opt_sym,
+                                    });
+                                } else {
+                                    open = Some(pos);
+                                }
+                            } else {
+                                open = Some(pos);
+                            }
+                        } else {
+                            open = Some(pos);
+                        }
                     }
 
                     if open.is_none() && side != SignalSide::Flat {
@@ -556,39 +558,25 @@ impl OptionBacktestEngine {
                             SignalSide::LongPut => OptionType::Put,
                             SignalSide::Flat => OptionType::Call,
                         };
-                        let strike = bar.open.max(0.01);
-                        let (entry_px, entry_slip, entry_spread, opt_sym) = if let Some(q_map) =
-                            quotes_map
-                        {
-                            if let Some(quotes) = q_map.get(&bar_ts) {
-                                if let Some(q) = quotes.iter().find(|q| q.option_type == ty) {
-                                    let slip = q.ask * self.cfg.slippage_bps / 10_000.0;
-                                    (q.ask + slip, slip, q.spread(), Some(q.symbol.clone()))
-                                } else {
-                                    let (p, s, sp) =
-                                        self.compute_bs_entry(bar.open, strike, dte_days, ty);
-                                    (p, s, sp, None)
-                                }
-                            } else {
-                                let (p, s, sp) =
-                                    self.compute_bs_entry(bar.open, strike, dte_days, ty);
-                                (p, s, sp, None)
-                            }
-                        } else {
-                            let (p, s, sp) = self.compute_bs_entry(bar.open, strike, dte_days, ty);
-                            (p, s, sp, None)
-                        };
+                        if let Some(quotes) = q_map.get(&bar_ts) {
+                            if let Some(q) = quotes.iter().find(|q| q.option_type == ty) {
+                                let slip = q.ask * self.cfg.slippage_bps / 10_000.0;
+                                let entry_px = q.ask + slip;
+                                let entry_slip = slip;
+                                let entry_spread = q.spread();
+                                let opt_sym = Some(q.symbol.clone());
 
-                        open = Some(OpenOptionPosition {
-                            side,
-                            entry_px,
-                            strike,
-                            ets: bar_ts,
-                            ei: i,
-                            entry_slip,
-                            entry_spread,
-                            opt_sym,
-                        });
+                                open = Some(OpenOptionPosition {
+                                    side,
+                                    entry_px,
+                                    ets: bar_ts,
+                                    ei: i,
+                                    entry_slip,
+                                    entry_spread,
+                                    opt_sym,
+                                });
+                            }
+                        }
                     }
                 }
             }
@@ -612,8 +600,18 @@ impl OptionBacktestEngine {
                 SignalSide::Flat => OptionType::Call,
             };
             let bars_held = bars.len().saturating_sub(pos.ei);
-            let (exit_px, exit_slip, exit_spread) =
-                self.compute_bs_exit(b.close, pos.strike, bars_held, dte_days, ty);
+            let quotes = q_map
+                .get(&b.ts.timestamp())
+                .ok_or(BacktestError::InsufficientData)?;
+            let q = quotes
+                .iter()
+                .find(|q| q.option_type == ty)
+                .ok_or(BacktestError::InsufficientData)?;
+            let slip = q.bid * self.cfg.slippage_bps / 10_000.0;
+            let exit_px = q.bid - slip;
+            let exit_slip = slip;
+            let exit_spread = q.spread();
+
             let fees =
                 (pos.entry_px + exit_px) * self.cfg.multiplier * (self.cfg.fee_bps / 10_000.0);
             let pnl = (exit_px - pos.entry_px) * self.cfg.multiplier - fees;
@@ -663,44 +661,6 @@ impl OptionBacktestEngine {
             cvar_95: stats.cvar_95,
             gain_loss_ratio: stats.gain_loss_ratio,
         })
-    }
-
-    fn compute_bs_entry(
-        &self,
-        spot: f64,
-        strike: f64,
-        dte_days: f64,
-        ty: OptionType,
-    ) -> (f64, f64, f64) {
-        let theoretical =
-            option_mark_bs(spot, strike, dte_days, self.cfg.assumed_iv, 0.04, ty).max(0.10);
-        let spread_cost = theoretical * (self.cfg.spread_bps / 2.0) / 10_000.0;
-        let slip_cost = theoretical * self.cfg.slippage_bps / 10_000.0;
-        (
-            theoretical + spread_cost + slip_cost,
-            slip_cost,
-            spread_cost,
-        )
-    }
-
-    fn compute_bs_exit(
-        &self,
-        spot: f64,
-        strike: f64,
-        bars_held: usize,
-        dte_days: f64,
-        ty: OptionType,
-    ) -> (f64, f64, f64) {
-        let remaining_days = (dte_days - bars_held as f64 * 5.0 / 1440.0).max(0.01);
-        let theoretical =
-            option_mark_bs(spot, strike, remaining_days, self.cfg.assumed_iv, 0.04, ty).max(0.01);
-        let spread_cost = theoretical * (self.cfg.spread_bps / 2.0) / 10_000.0;
-        let slip_cost = theoretical * self.cfg.slippage_bps / 10_000.0;
-        (
-            theoretical - spread_cost - slip_cost,
-            slip_cost,
-            spread_cost,
-        )
     }
 }
 
@@ -858,7 +818,7 @@ impl Backtester {
         strategy: &mut dyn Strategy,
         bars: &[Bar],
     ) -> Result<BacktestReport, BacktestError> {
-        let engine = OptionBacktestEngine::new(self.cfg.clone());
+        let engine = UnderlyingBacktestEngine::new(self.cfg.clone());
         engine.run(strategy, bars)
     }
 
@@ -992,8 +952,48 @@ mod tests {
         let bars = make_test_bars(40);
         let mut strat = DummyMovingStrategy::new();
         let engine = OptionBacktestEngine::new(BacktestConfig::default());
+
+        let mut quotes_map = std::collections::HashMap::new();
+        for b in &bars {
+            quotes_map.insert(
+                b.ts.timestamp(),
+                vec![
+                    OptionQuote {
+                        symbol: format!("SPY-{}-C", b.ts.timestamp()),
+                        underlying: "SPY".into(),
+                        option_type: OptionType::Call,
+                        strike: 500.0,
+                        expiry: b.ts + Duration::days(7),
+                        bid: 4.90,
+                        ask: 5.10,
+                        last: 5.00,
+                        iv: 0.20,
+                        greeks: None,
+                        open_interest: 100,
+                        volume: 50,
+                        quote_ts: b.ts,
+                    },
+                    OptionQuote {
+                        symbol: format!("SPY-{}-P", b.ts.timestamp()),
+                        underlying: "SPY".into(),
+                        option_type: OptionType::Put,
+                        strike: 500.0,
+                        expiry: b.ts + Duration::days(7),
+                        bid: 4.90,
+                        ask: 5.10,
+                        last: 5.00,
+                        iv: 0.20,
+                        greeks: None,
+                        open_interest: 100,
+                        volume: 50,
+                        quote_ts: b.ts,
+                    },
+                ],
+            );
+        }
+
         let report = engine
-            .run(&mut strat, &bars)
+            .run_with_quotes(&mut strat, &bars, Some(&quotes_map))
             .expect("option backtest must succeed");
 
         assert_eq!(report.strategy_id, "dummy_moving");

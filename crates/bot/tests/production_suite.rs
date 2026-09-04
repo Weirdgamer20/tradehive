@@ -150,6 +150,7 @@ fn test_realistic_options_execution_and_liquidity_rejection() {
             volume: 5,         // < 50
             open_interest: 10, // < 100
             iv: Some(0.20),
+            greeks: None,
             as_of: now,
         }],
     };
@@ -177,6 +178,7 @@ fn test_realistic_options_execution_and_liquidity_rejection() {
             volume: 500,
             open_interest: 1500,
             iv: Some(0.20),
+            greeks: None,
             as_of: now,
         }],
     };
@@ -456,8 +458,30 @@ fn test_underlying_vs_option_backtest_divergence() {
     let opt_engine = OptionBacktestEngine::new(BacktestConfig::default());
     let und_engine = UnderlyingBacktestEngine::new(BacktestConfig::default());
 
+    let mut quotes_map = std::collections::HashMap::new();
+    for b in &bars {
+        quotes_map.insert(
+            b.ts.timestamp(),
+            vec![th_domain::OptionQuote {
+                symbol: format!("SPY-{}-C", b.ts.timestamp()),
+                underlying: "SPY".into(),
+                option_type: th_domain::OptionType::Call,
+                strike: 500.0,
+                expiry: b.ts + chrono::Duration::days(7),
+                bid: 4.90,
+                ask: 5.10,
+                last: 5.00,
+                iv: 0.20,
+                greeks: None,
+                open_interest: 100,
+                volume: 50,
+                quote_ts: b.ts,
+            }],
+        );
+    }
+
     let opt_rep = opt_engine
-        .run(&mut strat_opt, &bars)
+        .run_with_quotes(&mut strat_opt, &bars, Some(&quotes_map))
         .expect("option backtest must succeed");
     let und_rep = und_engine
         .run(&mut strat_und, &bars)

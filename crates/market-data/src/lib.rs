@@ -349,22 +349,41 @@ impl MarketDataProvider for AlpacaProvider {
                     continue;
                 };
                 let Some(q) = x.latest_quote else { continue };
-                let bid = q.bp.unwrap_or(0.0);
-                let ask = q.ap.unwrap_or(0.0);
+                let Some(bid) = q.bp else { continue };
+                let Some(ask) = q.ap else { continue };
                 if bid <= 0.0 || ask < bid {
                     continue;
                 }
-                let last = x.latest_trade.as_ref().and_then(|z| z.p).unwrap_or(0.0);
+                let last = x
+                    .latest_trade
+                    .as_ref()
+                    .and_then(|z| z.p)
+                    .unwrap_or((bid + ask) / 2.0);
                 let Some(quote_ts) = q.t.as_deref().and_then(|s| parse_ts(s).ok()) else {
                     continue;
                 };
-                let g = x.greeks.map(|z| Greeks {
-                    delta: z.delta.unwrap_or(0.0),
-                    gamma: z.gamma.unwrap_or(0.0),
-                    theta: z.theta.unwrap_or(0.0),
-                    vega: z.vega.unwrap_or(0.0),
-                    rho: z.rho.unwrap_or(0.0),
-                });
+                // Hard invariant: never substitute 0.0 for IV. Only include if IV is valid and positive.
+                let Some(iv) = x.implied_volatility else {
+                    continue;
+                };
+                if !iv.is_finite() || iv <= 0.0 {
+                    continue;
+                }
+                // Hard invariant: never substitute 0.0 for Greeks. If any Greek component is missing, set greeks to None.
+                let g = x
+                    .greeks
+                    .and_then(|z| match (z.delta, z.gamma, z.theta, z.vega, z.rho) {
+                        (Some(delta), Some(gamma), Some(theta), Some(vega), Some(rho)) => {
+                            Some(Greeks {
+                                delta,
+                                gamma,
+                                theta,
+                                vega,
+                                rho,
+                            })
+                        }
+                        _ => None,
+                    });
                 quotes.push(OptionQuote {
                     symbol,
                     underlying: underlying.into(),
@@ -374,7 +393,7 @@ impl MarketDataProvider for AlpacaProvider {
                     bid,
                     ask,
                     last,
-                    iv: x.implied_volatility.unwrap_or(0.0),
+                    iv,
                     greeks: g,
                     open_interest: x.open_interest.unwrap_or(0),
                     volume: x.volume.unwrap_or(0),
@@ -511,96 +530,4 @@ pub fn aggregate_5m(symbol: &str, mut bars: Vec<Bar>) -> Result<Vec<Bar>, Market
         out.push(c)
     }
     Ok(out)
-}
-
-#[cfg(any(test, feature = "test-utils"))]
-pub fn synthetic_option_chain(underlying: &str, spot: f64, now: DateTime<Utc>) -> OptionChain {
-    use th_domain::OptionType;
-    let expiry = now + chrono::Duration::minutes(240);
-    let mut quotes = Vec::new();
-    for i in -10..=10 {
-        let strike = (spot + i as f64 * 2.0).max(1.0);
-        for ty in [OptionType::Call, OptionType::Put] {
-            let intrinsic = match ty {
-                OptionType::Call => (spot - strike).max(0.0),
-                OptionType::Put => (strike - spot).max(0.0),
-            };
-            let mid = (intrinsic + 1.0).max(0.1);
-            quotes.push(OptionQuote {
-                symbol: format!("{}-{}-{}", underlying, strike, i),
-                underlying: underlying.into(),
-                option_type: ty,
-                strike,
-                expiry,
-                bid: (mid - 0.03).max(0.01),
-                ask: mid + 0.03,
-                last: mid,
-                iv: 0.25,
-                greeks: Some(Greeks {
-                    delta: if ty == OptionType::Call { 0.5 } else { -0.5 },
-                    gamma: 0.02,
-                    theta: -0.02,
-                    vega: 0.1,
-                    rho: 0.0,
-                }),
-                open_interest: 100,
-                volume: 100,
-                quote_ts: now,
-            });
-        }
-    }
-    OptionChain {
-        underlying: underlying.into(),
-        as_of: now,
-        quotes,
-    }
-}
-
-#[cfg(any(test, feature = "test-utils"))]
-pub struct SyntheticProvider;
-#[cfg(any(test, feature = "test-utils"))]
-#[async_trait]
-impl MarketDataProvider for SyntheticProvider {
-    async fn most_actives(&self, _limit: usize) -> Result<Vec<String>, MarketDataError> {
-        // Test stub: returns a small fixed universe for deterministic tests
-        Ok(vec!["SPY".into(), "QQQ".into(), "IWM".into()])
-    }
-    async fn bars(
-        &self,
-        symbol: &str,
-        _start: DateTime<Utc>,
-        _end: DateTime<Utc>,
-    ) -> Result<Vec<Bar>, MarketDataError> {
-        let mut bars = Vec::new();
-        let total_bars = 120;
-        let now = Utc::now();
-        for i in 0..total_bars {
-            let ts = now - chrono::Duration::seconds((total_bars - 1 - i) * 60);
-            bars.push(Bar {
-                symbol: symbol.into(),
-                ts,
-                open: 500.0 + (i as f64 * 0.1),
-                high: 501.0 + (i as f64 * 0.1),
-                low: 499.0 + (i as f64 * 0.1),
-                close: 500.5 + (i as f64 * 0.1),
-                volume: 1000.0,
-            });
-        }
-        Ok(bars)
-    }
-    async fn option_chain(
-        &self,
-        underlying: &str,
-        as_of: DateTime<Utc>,
-    ) -> Result<OptionChain, MarketDataError> {
-        Ok(synthetic_option_chain(underlying, 500.0, as_of))
-    }
-    async fn news(
-        &self,
-        _: &str,
-        _: DateTime<Utc>,
-        _: DateTime<Utc>,
-    ) -> Result<Vec<NewsEvent>, MarketDataError> {
-        Ok(vec![])
-    }
 }
