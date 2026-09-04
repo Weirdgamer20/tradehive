@@ -6,7 +6,8 @@ use th_domain::{
 };
 use th_execution::{Broker, PaperBroker};
 use th_options_data::{
-    OptionChain, OptionDataError, OptionQuote, OptionRankingConfig, OptionRankingPipeline,
+    OptionChain, OptionDataError, OptionGreeks, OptionQuote, OptionRankingConfig,
+    OptionRankingPipeline,
 };
 use th_research::{
     deflated_sharpe_ratio, monte_carlo_permutation_test, probabilistic_sharpe_ratio,
@@ -57,6 +58,8 @@ async fn test_order_crash_and_unknown_recovery() {
         decision_id: Some(Uuid::new_v4()),
         oms_state: Some(OmsState::Unknown),
         option_action: None,
+        order_type: None,
+        stop_price: None,
     };
 
     assert!(order.oms_state.unwrap().is_ambiguous());
@@ -178,7 +181,13 @@ fn test_realistic_options_execution_and_liquidity_rejection() {
             volume: 500,
             open_interest: 1500,
             iv: Some(0.20),
-            greeks: None,
+            greeks: Some(OptionGreeks {
+                delta: 0.50,
+                gamma: 0.02,
+                theta: -0.05,
+                vega: 0.10,
+                rho: 0.01,
+            }),
             as_of: now,
         }],
     };
@@ -353,6 +362,8 @@ fn test_portfolio_concentration_and_daily_drawdown_halt() {
         decision_id: None,
         oms_state: None,
         option_action: None,
+        order_type: None,
+        stop_price: None,
     };
     let res = governor.authorize(&order, 2.0, 50.0, &breach_portfolio);
     assert!(res.is_err(), "Daily loss breach must halt new order entry");
@@ -408,6 +419,9 @@ fn test_underlying_vs_option_backtest_divergence() {
                     session_id: None,
                     bot_id: None,
                     candidate_id: None,
+                    proposed_stop_loss_pct: None,
+                    proposed_take_profit_pct: None,
+                    proposed_max_hold_minutes: None,
                 })
             } else {
                 None
@@ -542,6 +556,8 @@ fn test_option_order_actions_and_alpaca_position_intent() {
         decision_id: None,
         oms_state: None,
         option_action: None,
+        order_type: None,
+        stop_price: None,
     };
     assert_eq!(
         intent.resolve_option_action(),

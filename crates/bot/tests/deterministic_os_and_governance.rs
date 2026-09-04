@@ -137,6 +137,9 @@ fn test_portfolio_meta_controller_and_experience_store() {
         session_id: None,
         bot_id: None,
         candidate_id: None,
+        proposed_stop_loss_pct: None,
+        proposed_take_profit_pct: None,
+        proposed_max_hold_minutes: None,
     };
 
     let allocations =

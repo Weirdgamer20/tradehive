@@ -261,6 +261,8 @@ pub struct OptionChain {
     pub underlying: String,
     pub as_of: DateTime<Utc>,
     pub quotes: Vec<OptionQuote>,
+    #[serde(default)]
+    pub underlying_spot: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -285,6 +287,12 @@ pub struct Signal {
     pub bot_id: Option<String>,
     #[serde(default)]
     pub candidate_id: Option<String>,
+    #[serde(default)]
+    pub proposed_stop_loss_pct: Option<f64>,
+    #[serde(default)]
+    pub proposed_take_profit_pct: Option<f64>,
+    #[serde(default)]
+    pub proposed_max_hold_minutes: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -414,6 +422,14 @@ pub struct ProvenanceChain {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OrderType {
+    Market,
+    Limit,
+    Stop,
+    StopLimit,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderIntent {
     pub client_order_id: Uuid,
@@ -435,6 +451,10 @@ pub struct OrderIntent {
     pub oms_state: Option<OmsState>,
     #[serde(default)]
     pub option_action: Option<OptionOrderAction>,
+    #[serde(default)]
+    pub order_type: Option<OrderType>,
+    #[serde(default)]
+    pub stop_price: Option<f64>,
 }
 impl OrderIntent {
     pub fn resolve_option_action(&self) -> OptionOrderAction {
@@ -449,6 +469,21 @@ impl OrderIntent {
         }
     }
 
+    pub fn resolved_order_type(&self) -> OrderType {
+        if let Some(t) = self.order_type {
+            return t;
+        }
+        if self.stop_price.is_some() && self.limit_price.is_some() {
+            OrderType::StopLimit
+        } else if self.stop_price.is_some() {
+            OrderType::Stop
+        } else if self.limit_price.is_some() {
+            OrderType::Limit
+        } else {
+            OrderType::Market
+        }
+    }
+
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.qty == 0 {
             return Err(DomainError::Invalid("zero quantity".into()));
@@ -460,6 +495,29 @@ impl OrderIntent {
             if !p.is_finite() || p <= 0.0 {
                 return Err(DomainError::Invalid("invalid limit price".into()));
             }
+        }
+        if let Some(sp) = self.stop_price {
+            if !sp.is_finite() || sp <= 0.0 {
+                return Err(DomainError::Invalid("invalid stop price".into()));
+            }
+        }
+        match self.resolved_order_type() {
+            OrderType::Stop => {
+                if self.stop_price.is_none() {
+                    return Err(DomainError::Invalid("stop order requires stop_price".into()));
+                }
+            }
+            OrderType::StopLimit => {
+                if self.stop_price.is_none() || self.limit_price.is_none() {
+                    return Err(DomainError::Invalid("stop-limit order requires stop_price and limit_price".into()));
+                }
+            }
+            OrderType::Limit => {
+                if self.limit_price.is_none() {
+                    return Err(DomainError::Invalid("limit order requires limit_price".into()));
+                }
+            }
+            OrderType::Market => {}
         }
         if self.strategy_id.trim().is_empty() {
             return Err(DomainError::Invalid("empty strategy id".into()));
@@ -1181,6 +1239,8 @@ mod tests {
             decision_id: None,
             oms_state: None,
             option_action: None,
+            order_type: None,
+            stop_price: None,
         };
         assert_eq!(
             intent_open.resolve_option_action(),

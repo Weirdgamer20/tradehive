@@ -62,7 +62,8 @@ impl OptionChain {
 
 impl From<&th_domain::OptionChain> for OptionChain {
     fn from(c: &th_domain::OptionChain) -> Self {
-        let spot = c.quotes.first().map(|q| q.strike).unwrap_or(100.0);
+        // Real spot price must be provided via underlying_spot; no synthetic strike or 100.0 fallback
+        let spot = c.underlying_spot.unwrap_or(0.0);
         Self {
             underlying: c.underlying.clone(),
             spot,
@@ -215,11 +216,13 @@ impl OptionRankingPipeline {
                 continue;
             }
 
-            let greeks = q.greeks.clone();
-            let delta = greeks
-                .as_ref()
-                .map(|g| g.delta.abs())
-                .unwrap_or(self.config.target_delta);
+            let Some(greeks) = &q.greeks else {
+                continue;
+            };
+            if !greeks.delta.is_finite() {
+                continue;
+            }
+            let delta = greeks.delta.abs();
 
             // Step 13-16: Scored factors
             let delta_fit = 1.0 - (delta - self.config.target_delta).abs() * 2.0;
@@ -233,7 +236,7 @@ impl OptionRankingPipeline {
 
             ranked.push(RankedOptionCandidate {
                 quote: q.clone(),
-                greeks,
+                greeks: Some(greeks.clone()),
                 spread_bps,
                 dte_minutes: dte_mins,
                 composite_score,

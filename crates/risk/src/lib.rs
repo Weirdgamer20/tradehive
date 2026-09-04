@@ -146,6 +146,20 @@ impl PortfolioRisk {
         self.open_orders = orders;
         self
     }
+    fn resolve_order_price(&self, o: &OrderIntent) -> f64 {
+        if let Some(p) = o.limit_price.or(o.stop_price) {
+            if p.is_finite() && p > 0.0 {
+                return p;
+            }
+        }
+        if let Some(pos) = self.positions.iter().find(|p| p.symbol == o.symbol) {
+            if pos.mark.is_finite() && pos.mark > 0.0 {
+                return pos.mark.abs();
+            }
+        }
+        // Conservative baseline reference price: never underestimate risk as 0.0
+        1.0
+    }
     pub fn total_notional(&self) -> f64 {
         let pos_notional: f64 = self.positions
             .iter()
@@ -154,7 +168,7 @@ impl PortfolioRisk {
         let orders_notional: f64 = self.open_orders
             .iter()
             .filter(|o| !o.reduce_only)
-            .map(|o| o.qty as f64 * o.limit_price.unwrap_or(0.0) * CONTRACT_MULTIPLIER)
+            .map(|o| o.qty as f64 * self.resolve_order_price(o) * CONTRACT_MULTIPLIER)
             .sum();
         pos_notional + orders_notional
     }
@@ -168,7 +182,7 @@ impl PortfolioRisk {
         let orders_notional: f64 = self.open_orders
             .iter()
             .filter(|o| !o.reduce_only && underlying_from_symbol(&o.symbol) == target)
-            .map(|o| o.qty as f64 * o.limit_price.unwrap_or(0.0) * CONTRACT_MULTIPLIER)
+            .map(|o| o.qty as f64 * self.resolve_order_price(o) * CONTRACT_MULTIPLIER)
             .sum();
         pos_notional + orders_notional
     }
@@ -462,6 +476,8 @@ mod tests {
             decision_id: None,
             oms_state: None,
             option_action: None,
+            order_type: None,
+            stop_price: None,
         };
         let normal_portfolio = PortfolioRisk {
             cash: 10_000.0,

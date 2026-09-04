@@ -148,7 +148,7 @@ impl QLearning {
     }
     pub fn unique_actions(&self) -> Vec<String> {
         let mut set = std::collections::BTreeSet::new();
-        for ((_, action), _) in &self.q {
+        for (_, action) in self.q.keys() {
             set.insert(action.clone());
         }
         set.into_iter().collect()
@@ -722,14 +722,37 @@ pub fn learn_from_trades(
         let state = StateKey::from_state(&classify_regime(
             &bars[..=bars.iter().position(|b| b.ts == entry_bar.ts).unwrap_or(0)],
         ));
-        let next_state = state.clone();
+        // REAL DATA ONLY: If fill price, slippage, spread, or exit timestamp is missing, reject incomplete experience
+        let Some(entry_fill) = t.entry_fill_price else {
+            continue;
+        };
+        let Some(exit_ts) = t.exit else {
+            continue;
+        };
+        let Some(slippage) = t.slippage_bps else {
+            continue;
+        };
+        let Some(spread) = t.quote_spread_bps else {
+            continue;
+        };
+        if !entry_fill.is_finite() || entry_fill <= 0.0 || !slippage.is_finite() || !spread.is_finite() {
+            continue;
+        }
+        let duration_mins = (exit_ts - t.entry).num_minutes().max(0) as usize;
+        let bars_held = (duration_mins / 5).max(1);
+        let capital = entry_fill * 100.0;
+        let fees = if t.fees.is_finite() && t.fees >= 0.0 { t.fees } else { 0.0 };
+
+        let exit_idx = bars.iter().rposition(|b| b.ts <= exit_ts).unwrap_or(0);
+        let next_state = StateKey::from_state(&classify_regime(&bars[..=exit_idx]));
+
         let reward = compute_economic_rl_reward(
             t.pnl,
-            t.entry_fill_price.unwrap_or(1.0) * 100.0,
-            t.slippage_bps.unwrap_or(2.0),
-            t.quote_spread_bps.unwrap_or(5.0),
-            1.5,
-            12,
+            capital,
+            slippage,
+            spread,
+            fees,
+            bars_held,
         )
         .composite_reward;
         q.update(&Experience {
@@ -739,7 +762,7 @@ pub fn learn_from_trades(
             next_state,
             terminal: true,
             decision_ts: t.entry,
-            outcome_ts: t.exit.unwrap_or(t.entry),
+            outcome_ts: exit_ts,
         });
         updates += 1;
     }
@@ -2141,6 +2164,7 @@ mod manufacturing_tests {
                 underlying: "SPY".into(),
                 as_of: now,
                 quotes: vec![quote],
+                underlying_spot: Some(500.0),
             },
         );
         let plans = manufacture_promoted_bots(
@@ -2236,6 +2260,7 @@ mod manufacturing_tests {
                 underlying: "SPY".into(),
                 as_of: now,
                 quotes: vec![quote],
+                underlying_spot: Some(500.0),
             },
         );
 

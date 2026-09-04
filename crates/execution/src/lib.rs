@@ -147,9 +147,19 @@ impl Broker for PaperBroker {
             return Err(ExecutionError::Duplicate(existing.client_order_id));
         }
 
-        let base_px = o
-            .limit_price
-            .ok_or_else(|| ExecutionError::Invalid("paper broker requires limit price".into()))?;
+        let base_px = match o.resolved_order_type() {
+            th_domain::OrderType::Limit | th_domain::OrderType::StopLimit => o
+                .limit_price
+                .ok_or_else(|| ExecutionError::Invalid("limit/stop-limit order requires limit price".into()))?,
+            th_domain::OrderType::Stop => o
+                .stop_price
+                .ok_or_else(|| ExecutionError::Invalid("stop order requires stop price".into()))?,
+            th_domain::OrderType::Market => {
+                s.positions.get(&o.symbol).map(|p| p.mark.abs().max(0.01)).unwrap_or_else(|| {
+                    o.limit_price.or(o.stop_price).unwrap_or(1.0)
+                })
+            }
+        };
         if !base_px.is_finite() || base_px <= 0.0 {
             return Err(ExecutionError::Invalid(
                 "invalid paper execution price".into(),
@@ -487,18 +497,31 @@ impl Broker for AlpacaBroker {
                 }
             }
         };
+        let (order_type_str, send_limit, send_stop) = match o.resolved_order_type() {
+            th_domain::OrderType::Market => ("market", false, false),
+            th_domain::OrderType::Limit => ("limit", true, false),
+            th_domain::OrderType::Stop => ("stop", false, true),
+            th_domain::OrderType::StopLimit => ("stop_limit", true, true),
+        };
         let mut body = serde_json::json!({
             "symbol": o.symbol,
             "qty": o.qty.to_string(),
             "side": side,
-            "type": if o.limit_price.is_some() { "limit" } else { "market" },
+            "type": order_type_str,
             "time_in_force": "day",
             "client_order_id": o.client_order_id.to_string(),
             "order_class": "simple",
             "position_intent": position_intent,
         });
-        if let Some(p) = o.limit_price {
-            body["limit_price"] = serde_json::json!(p);
+        if send_limit {
+            if let Some(p) = o.limit_price {
+                body["limit_price"] = serde_json::json!(p);
+            }
+        }
+        if send_stop {
+            if let Some(sp) = o.stop_price {
+                body["stop_price"] = serde_json::json!(sp);
+            }
         }
         let url = format!("{}/v2/orders", self.base_url.trim_end_matches('/'));
         let r = self
@@ -836,8 +859,14 @@ pub fn order_hash(o: &OrderIntent) -> String {
     h.update([0]);
     h.update(o.qty.to_le_bytes());
     if let Some(p) = o.limit_price {
-        h.update(p.to_le_bytes())
+        h.update(p.to_le_bytes());
     }
+    h.update([0]);
+    if let Some(sp) = o.stop_price {
+        h.update(sp.to_le_bytes());
+    }
+    h.update([0]);
+    h.update(format!("{:?}", o.resolved_order_type()).as_bytes());
     h.update([0]);
     h.update([o.reduce_only as u8]);
     h.update([0]);
@@ -1067,6 +1096,8 @@ mod tests {
             decision_id: None,
             oms_state: None,
             option_action: None,
+            order_type: Some(th_domain::OrderType::Limit),
+            stop_price: None,
         };
 
         let submitted = broker.submit(&intent).await.expect("submit must succeed");
@@ -1076,5 +1107,29 @@ mod tests {
         assert_eq!(positions.len(), 1);
         assert_eq!(positions[0].symbol, "SPY260904C00500000");
         assert_eq!(positions[0].qty, 2);
+
+        // Test Market reduce-only exit order execution
+        let exit_intent = OrderIntent {
+            client_order_id: Uuid::new_v4(),
+            symbol: "SPY260904C00500000".into(),
+            side: OrderSide::Sell,
+            qty: 2,
+            limit_price: None,
+            reduce_only: true,
+            strategy_id: "strat1".into(),
+            created_at: Utc::now(),
+            order_hash: "hash".into(),
+            bot_id: None,
+            session_id: None,
+            decision_id: None,
+            oms_state: None,
+            option_action: None,
+            order_type: Some(th_domain::OrderType::Market),
+            stop_price: None,
+        };
+        let exit_res = broker.submit(&exit_intent).await.expect("market exit must succeed");
+        assert_eq!(exit_res.client_order_id, exit_intent.client_order_id);
+        let flat_positions = broker.positions().await.expect("positions must succeed");
+        assert!(flat_positions.is_empty() || flat_positions.iter().all(|p| p.qty == 0));
     }
 }

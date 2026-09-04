@@ -409,6 +409,7 @@ impl MarketDataProvider for AlpacaProvider {
             underlying: underlying.into(),
             as_of,
             quotes,
+            underlying_spot: None,
         })
     }
     async fn news(

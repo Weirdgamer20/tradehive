@@ -114,6 +114,7 @@ impl MarketDataProvider for StubMarketDataProvider {
                     quote_ts: as_of,
                 },
             ],
+            underlying_spot: Some(500.0),
         })
     }
     async fn news(
@@ -1347,6 +1348,8 @@ async fn test_paper_broker_partial_fill_accounting_consistency() {
         decision_id: Some(Uuid::new_v4()),
         oms_state: Some(OmsState::Unknown),
         option_action: None,
+        order_type: None,
+        stop_price: None,
     };
 
     let bo = broker.submit(&order).await.unwrap();

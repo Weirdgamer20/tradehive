@@ -548,24 +548,30 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
         if let Err(e) = self.execution.broker_ref().cancel_all_orders().await {
             eprintln!("EMERGENCY_CANCEL_ALL_FAILED: {e}");
         }
-        let broker_positions = self.execution.positions().await.unwrap_or_default();
-        for pos in broker_positions {
+        let broker_positions = self
+            .execution
+            .positions()
+            .await
+            .map_err(|e| RuntimeError::Execution(format!("failed to fetch broker positions during emergency liquidation: {e}")))?;
+
+        for pos in &broker_positions {
             if pos.qty == 0 {
                 continue;
             }
-            let qty = pos.qty.unsigned_abs() as u32;
+            let qty = pos.qty.unsigned_abs();
             let side = if pos.qty > 0 {
                 OrderSide::Sell
             } else {
                 OrderSide::Buy
             };
-            let mark = pos.mark.abs().max(0.01);
             let mut exit_order = OrderIntent {
                 client_order_id: Uuid::new_v4(),
                 symbol: pos.symbol.clone(),
                 side,
                 qty,
-                limit_price: Some(mark),
+                order_type: Some(th_domain::OrderType::Market),
+                limit_price: None,
+                stop_price: None,
                 reduce_only: true,
                 strategy_id: "EMERGENCY_LIQUIDATE".into(),
                 created_at: Utc::now(),
@@ -574,15 +580,44 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                 session_id: self.current_session_id.clone(),
                 decision_id: None,
                 oms_state: Some(th_domain::OmsState::IntentCreated),
-                option_action: Some(OptionOrderAction::SellToClose),
+                option_action: Some(if pos.qty > 0 {
+                    OptionOrderAction::SellToClose
+                } else {
+                    OptionOrderAction::BuyToClose
+                }),
             };
             exit_order.order_hash = order_hash(&exit_order);
-            let _ = self.execution.broker_ref().submit(&exit_order).await;
+            if let Err(e) = self.execution.broker_ref().submit(&exit_order).await {
+                eprintln!("EMERGENCY_LIQUIDATE_SUBMIT_FAILED symbol={} err={e}", pos.symbol);
+            }
         }
+
+        // Authoritative flat verification: Re-query broker positions before removing local trade tracking
+        let confirmed_positions = self
+            .execution
+            .positions()
+            .await
+            .map_err(|e| RuntimeError::Execution(format!("failed to verify positions after emergency liquidation: {e}")))?;
+        let active_symbols: std::collections::HashSet<String> = confirmed_positions
+            .iter()
+            .filter(|p| p.qty != 0)
+            .map(|p| p.symbol.clone())
+            .collect();
+
         let symbols: Vec<String> = self.open_trades.keys().cloned().collect();
         for sym in symbols {
-            self.open_trades.remove(&sym);
-            let _ = self.store.delete_open_trade(&sym);
+            if !active_symbols.contains(&sym) {
+                self.open_trades.remove(&sym);
+                let _ = self.store.delete_open_trade(&sym);
+            } else {
+                eprintln!("EMERGENCY_LIQUIDATION_INCOMPLETE symbol={sym}: broker position remains open");
+            }
+        }
+        if !active_symbols.is_empty() {
+            return Err(RuntimeError::Execution(format!(
+                "emergency liquidation incomplete: {} positions still active at broker",
+                active_symbols.len()
+            )));
         }
         Ok(())
     }
@@ -943,7 +978,9 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                     symbol: t.symbol.clone(),
                     side: OrderSide::Sell,
                     qty: t.qty,
-                    limit_price: Some(sl_price),
+                    order_type: Some(th_domain::OrderType::Stop),
+                    limit_price: None,
+                    stop_price: Some(sl_price),
                     reduce_only: true,
                     strategy_id: t.strategy_id.clone(),
                     created_at: Utc::now(),
@@ -1017,12 +1054,24 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                     positions: broker_positions,
                     open_orders: vec![],
                 };
+                let exit_order_type = if stop_loss_triggered {
+                    th_domain::OrderType::Market
+                } else {
+                    th_domain::OrderType::Limit
+                };
+                let exit_limit_price = if exit_order_type == th_domain::OrderType::Limit {
+                    Some(mark)
+                } else {
+                    None
+                };
                 let mut order = OrderIntent {
                     client_order_id: Uuid::new_v4(),
                     symbol: t.symbol.clone(),
                     side: OrderSide::Sell,
                     qty: t.qty,
-                    limit_price: Some(mark),
+                    order_type: Some(exit_order_type),
+                    limit_price: exit_limit_price,
+                    stop_price: None,
                     reduce_only: true,
                     strategy_id: t.strategy_id.clone(),
                     created_at: Utc::now(),
@@ -1389,7 +1438,7 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
             .broker_ref()
             .list_open_orders()
             .await
-            .unwrap_or_default();
+            .map_err(|e| RuntimeError::Execution(format!("failed to query broker open orders: {e}")))?;
         let open_orders: Vec<OrderIntent> = broker_open_orders
             .into_iter()
             .map(|bo| OrderIntent {
@@ -1407,6 +1456,8 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                 decision_id: None,
                 oms_state: None,
                 option_action: None,
+                order_type: None,
+                stop_price: None,
             })
             .collect();
         let portfolio = PortfolioRisk {
@@ -1546,6 +1597,8 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
             decision_id: Some(sig.id),
             oms_state: Some(th_domain::OmsState::IntentCreated),
             option_action: Some(OptionOrderAction::BuyToOpen),
+            order_type: Some(th_domain::OrderType::Limit),
+            stop_price: None,
         };
         order.order_hash = order_hash(&order);
         println!(
@@ -1697,7 +1750,21 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                 // we must submit a separate sell-to-close limit order post-fill.
                 // A4: Use deterministic client_order_id so crash recovery can find
                 // this order at the broker without double-submitting.
-                let sl_price = (fp * (1.0 - self.cfg.stop_loss_pct)).max(0.01);
+                // Adaptive / dynamic stop loss proposed by policy or signal, evaluated within safety envelope
+                let dynamic_stop_loss = sig.proposed_stop_loss_pct.unwrap_or_else(|| {
+                    let reg = classify_regime(self.bars.get(&sig.symbol).map(|b| b.as_slice()).unwrap_or(&[]));
+                    if reg.volatility > 0.02 {
+                        (self.cfg.stop_loss_pct * 1.25).min(0.12)
+                    } else if reg.volatility > 0.0 && reg.volatility < 0.008 {
+                        (self.cfg.stop_loss_pct * 0.75).max(0.02)
+                    } else {
+                        self.cfg.stop_loss_pct
+                    }
+                }).clamp(0.01, self.cfg.stop_loss_pct.max(0.15));
+
+                let dynamic_take_profit = sig.proposed_take_profit_pct.unwrap_or(dynamic_stop_loss * 2.5).clamp(0.02, 1.0);
+
+                let sl_price = (fp * (1.0 - dynamic_stop_loss)).max(0.01);
                 let protective_cid = protective_order_id_from_entry(
                     Some(order.client_order_id),
                     &order.symbol,
@@ -1708,7 +1775,9 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                     symbol: order.symbol.clone(),
                     side: OrderSide::Sell,
                     qty: bo.filled_qty,
-                    limit_price: Some(sl_price),
+                    order_type: Some(th_domain::OrderType::Stop),
+                    limit_price: None,
+                    stop_price: Some(sl_price),
                     reduce_only: true,
                     strategy_id: order.strategy_id.clone(),
                     created_at: Utc::now(),
@@ -1728,7 +1797,7 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                 {
                     Ok(pbo) => {
                         println!(
-                            "PROTECTIVE_ORDER_SUBMITTED symbol={} broker_order_id={} limit_price={:.2} qty={}",
+                            "PROTECTIVE_ORDER_SUBMITTED symbol={} broker_order_id={} stop_price={:.2} qty={}",
                             order.symbol, pbo.broker_order_id, sl_price, bo.filled_qty
                         );
                         Some(pbo.broker_order_id)
@@ -1737,7 +1806,7 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                         // Soft failure: the process-level manage_open_trade exit loop
                         // remains the safety net. The position is not abandoned.
                         println!(
-                            "PROTECTIVE_ORDER_FAILED symbol={} sl_price={:.2} error={}",
+                            "PROTECTIVE_ORDER_FAILED symbol={} stop_price={:.2} error={}",
                             order.symbol, sl_price, e
                         );
                         None
@@ -1752,8 +1821,8 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                     strategy_id: order.strategy_id.clone(),
                     entry_price: fp,
                     entry_ts: Utc::now(),
-                    stop_loss_pct: self.cfg.stop_loss_pct,
-                    take_profit_pct: self.cfg.take_profit_pct,
+                    stop_loss_pct: dynamic_stop_loss,
+                    take_profit_pct: dynamic_take_profit,
                     qty: bo.filled_qty,
                     protective_order_id: protective_broker_id,
                     client_order_id: Some(order.client_order_id),
@@ -1987,7 +2056,9 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                         symbol: t.symbol.clone(),
                         side: OrderSide::Sell,
                         qty: t.qty,
-                        limit_price: Some(sl_price),
+                        order_type: Some(th_domain::OrderType::Stop),
+                        limit_price: None,
+                        stop_price: Some(sl_price),
                         reduce_only: true,
                         strategy_id: t.strategy_id.clone(),
                         created_at: Utc::now(),
@@ -2783,7 +2854,9 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                 symbol: t.symbol.clone(),
                 side: OrderSide::Sell,
                 qty: t.qty,
-                limit_price: Some(mark),
+                order_type: Some(th_domain::OrderType::Market),
+                limit_price: None,
+                stop_price: None,
                 reduce_only: true,
                 strategy_id: t.strategy_id.clone(),
                 created_at: Utc::now(),

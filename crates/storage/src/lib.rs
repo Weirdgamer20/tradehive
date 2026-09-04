@@ -917,6 +917,8 @@ mod tests {
             decision_id: None,
             oms_state: None,
             option_action: None,
+            order_type: None,
+            stop_price: None,
         };
         assert!(s.reserve_order(&o).unwrap());
         assert!(!s.reserve_order(&o).unwrap());

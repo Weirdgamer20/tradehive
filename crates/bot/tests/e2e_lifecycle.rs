@@ -86,6 +86,7 @@ impl MarketDataProvider for TestLifecycleProvider {
                     quote_ts: as_of,
                 },
             ],
+            underlying_spot: Some(500.0),
         })
     }
     async fn news(

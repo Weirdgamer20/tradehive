@@ -89,15 +89,43 @@ impl ExperienceStore {
         .into();
 
         let slippage = t.slippage_bps.unwrap_or(0.0);
-        let exec_score = (1.0 - (slippage / 50.0)).clamp(0.0, 1.0);
-        let signal_score = if t.pnl > 0.0 { 1.0 } else { 0.2 };
-        let regime_score = if t.pnl > 0.0 { 0.9 } else { 0.4 };
+        let spread = t.quote_spread_bps.unwrap_or(0.0);
+        let notional = t
+            .entry_fill_price
+            .unwrap_or_else(|| t.signal_price.unwrap_or(1.0))
+            * 100.0;
+        let exec_friction = (slippage / 10_000.0) * notional + t.fees;
+        let exec_attribution = -exec_friction;
+        let alpha_attribution = t.pnl + exec_friction;
+
+        let exec_score = (1.0 - (slippage / 50.0).clamp(0.0, 1.0) - (spread / 100.0).clamp(0.0, 0.5))
+            .clamp(0.0, 1.0);
+        let signal_score = ((t.pnl / notional.max(10.0)).clamp(-1.0, 1.0) + 1.0) / 2.0;
+        let option_selection_score = (1.0 - (spread / 200.0)).clamp(0.0, 1.0);
+
+        let regime_score = if let Some(ref reg) = t.regime_at_entry {
+            let same_regime: Vec<&TradeRecord> = self
+                .trades
+                .iter()
+                .filter(|tr| tr.regime_at_entry.as_ref() == Some(reg))
+                .collect();
+            if same_regime.is_empty() {
+                0.5
+            } else {
+                let wins = same_regime.iter().filter(|tr| tr.pnl > 0.0).count();
+                (wins as f64 / same_regime.len() as f64).clamp(0.0, 1.0)
+            }
+        } else if t.pnl > 0.0 {
+            0.75
+        } else {
+            0.25
+        };
 
         let lessons = vec![
             format!("{} outcome={} pnl={:.2}", t.strategy_id, outcome, t.pnl),
             format!(
-                "Execution quality={:.2} slippage_bps={:.1}",
-                exec_score, slippage
+                "Execution quality={:.2} slippage_bps={:.1} spread_bps={:.1}",
+                exec_score, slippage, spread
             ),
         ];
 
@@ -110,13 +138,13 @@ impl ExperienceStore {
             outcome,
             pnl: t.pnl,
             attribution: vec![
-                ("alpha".into(), t.pnl * 0.8),
-                ("execution".into(), -slippage * 0.1),
+                ("alpha".into(), alpha_attribution),
+                ("execution".into(), exec_attribution),
             ],
             lessons,
             signal_quality_score: signal_score,
             execution_quality_score: exec_score,
-            option_selection_score: 0.85,
+            option_selection_score,
             regime_compatibility: regime_score,
             fingerprint: format!("{:x}", h.finalize()),
         };
