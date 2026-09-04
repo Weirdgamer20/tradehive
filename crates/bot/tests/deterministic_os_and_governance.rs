@@ -140,6 +140,7 @@ fn test_portfolio_meta_controller_and_experience_store() {
         proposed_stop_loss_pct: None,
         proposed_take_profit_pct: None,
         proposed_max_hold_minutes: None,
+        exit_policy: None,
     };
 
     let allocations =

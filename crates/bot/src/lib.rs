@@ -313,6 +313,14 @@ pub struct OpenTrade {
     pub client_order_id: Option<Uuid>,
     #[serde(default)]
     pub entry_state: Option<th_hive::StateKey>,
+    #[serde(default)]
+    pub quote_spread_bps: Option<f64>,
+    #[serde(default)]
+    pub entry_slippage_bps: Option<f64>,
+    #[serde(default)]
+    pub exit_policy: Option<th_domain::ExitPolicyProfile>,
+    #[serde(default)]
+    pub last_protective_filled_qty: u32,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionStats {
@@ -457,7 +465,10 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
             if let Ok(entry_ts) =
                 DateTime::parse_from_rfc3339(&row.entry_ts).map(|x| x.with_timezone(&Utc))
             {
-                let client_order_id = row.client_order_id.as_deref().and_then(|s| Uuid::parse_str(s).ok());
+                let client_order_id = row
+                    .client_order_id
+                    .as_deref()
+                    .and_then(|s| Uuid::parse_str(s).ok());
                 let entry_state = row.entry_state.map(|r| {
                     serde_json::from_str::<th_hive::StateKey>(&r).unwrap_or_else(|_| {
                         th_hive::StateKey {
@@ -480,6 +491,10 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                         protective_order_id: row.protective_order_id,
                         client_order_id,
                         entry_state,
+                        quote_spread_bps: row.quote_spread_bps,
+                        entry_slippage_bps: row.entry_slippage_bps,
+                        exit_policy: row.exit_policy.as_deref().and_then(th_domain::ExitPolicyProfile::from_str_name),
+                        last_protective_filled_qty: 0,
                     },
                 );
             }
@@ -545,15 +560,50 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
     }
     pub async fn emergency_liquidate_all(&mut self) -> Result<(), RuntimeError> {
         self.halt();
+        // Point 9: cancel all orders and verify no dangerous working orders remain
         if let Err(e) = self.execution.broker_ref().cancel_all_orders().await {
             eprintln!("EMERGENCY_CANCEL_ALL_FAILED: {e}");
+            return Err(RuntimeError::Execution(format!(
+                "EMERGENCY_CANCEL_ALL_FAILED: {e}"
+            )));
         }
-        let broker_positions = self
+        let open_orders = self
             .execution
-            .positions()
+            .broker_ref()
+            .list_open_orders()
             .await
-            .map_err(|e| RuntimeError::Execution(format!("failed to fetch broker positions during emergency liquidation: {e}")))?;
+            .map_err(|e| {
+                RuntimeError::Execution(format!(
+                    "failed to query broker open orders during emergency: {e}"
+                ))
+            })?;
+        let working_orders: Vec<_> = open_orders
+            .into_iter()
+            .filter(|o| {
+                matches!(
+                    o.status,
+                    OrderStatus::New | OrderStatus::Accepted | OrderStatus::PartiallyFilled
+                )
+            })
+            .collect();
+        if !working_orders.is_empty() {
+            eprintln!(
+                "EMERGENCY_CANCEL_INCOMPLETE: {} working orders remain",
+                working_orders.len()
+            );
+            return Err(RuntimeError::Execution(format!(
+                "emergency cancel incomplete: {} working orders remain at broker",
+                working_orders.len()
+            )));
+        }
 
+        let broker_positions = self.execution.positions().await.map_err(|e| {
+            RuntimeError::Execution(format!(
+                "failed to fetch broker positions during emergency liquidation: {e}"
+            ))
+        })?;
+
+        let mut submitted_order_ids = Vec::new();
         for pos in &broker_positions {
             if pos.qty == 0 {
                 continue;
@@ -587,17 +637,41 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                 }),
             };
             exit_order.order_hash = order_hash(&exit_order);
-            if let Err(e) = self.execution.broker_ref().submit(&exit_order).await {
-                eprintln!("EMERGENCY_LIQUIDATE_SUBMIT_FAILED symbol={} err={e}", pos.symbol);
+            match self.execution.broker_ref().submit(&exit_order).await {
+                Ok(bo) => {
+                    submitted_order_ids.push(bo.broker_order_id);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "EMERGENCY_LIQUIDATE_SUBMIT_FAILED symbol={} err={e}",
+                        pos.symbol
+                    );
+                }
+            }
+        }
+
+        // Point 8: Order-status-driven reconciliation with bounded exponential backoff
+        for boid in &submitted_order_ids {
+            let backoffs = [100, 250, 500, 1000, 2000, 3000];
+            for ms in backoffs {
+                tokio::time::sleep(tokio::time::Duration::from_millis(ms)).await;
+                if let Ok(bo) = self.execution.broker_ref().get_order(boid).await {
+                    if bo.status == OrderStatus::Filled
+                        || bo.status == OrderStatus::Cancelled
+                        || bo.status == OrderStatus::Rejected
+                    {
+                        break;
+                    }
+                }
             }
         }
 
         // Authoritative flat verification: Re-query broker positions before removing local trade tracking
-        let confirmed_positions = self
-            .execution
-            .positions()
-            .await
-            .map_err(|e| RuntimeError::Execution(format!("failed to verify positions after emergency liquidation: {e}")))?;
+        let confirmed_positions = self.execution.positions().await.map_err(|e| {
+            RuntimeError::Execution(format!(
+                "failed to verify positions after emergency liquidation: {e}"
+            ))
+        })?;
         let active_symbols: std::collections::HashSet<String> = confirmed_positions
             .iter()
             .filter(|p| p.qty != 0)
@@ -610,7 +684,9 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                 self.open_trades.remove(&sym);
                 let _ = self.store.delete_open_trade(&sym);
             } else {
-                eprintln!("EMERGENCY_LIQUIDATION_INCOMPLETE symbol={sym}: broker position remains open");
+                eprintln!(
+                    "EMERGENCY_LIQUIDATION_INCOMPLETE symbol={sym}: broker position remains open"
+                );
             }
         }
         if !active_symbols.is_empty() {
@@ -694,7 +770,8 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
         let snapshot = self.bars.get(&candle.symbol).cloned().unwrap_or_default();
         let state = classify_regime(&snapshot);
         self.manage_open_trade(&candle.symbol, &state).await?;
-        let state_key = th_hive::StateKey::from_state(&state);
+        let state_key =
+            th_hive::StateKey::from_state_with_open(&state, self.market_clock.is_open(candle.ts));
         // Strategy-to-bot routing: evaluate only strategies assigned to active bots for this symbol
         let assigned_strategies: Vec<String> = self
             .bot_plans
@@ -709,28 +786,49 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
             .map(|p| p.strategy_id.clone())
             .collect();
 
+        // Point 1 & 2: Factorized RL action space (strategy + exit policy profile)
+        let mut candidate_actions = Vec::new();
+        for strat in &assigned_strategies {
+            for profile in th_domain::ExitPolicyProfile::all() {
+                candidate_actions.push(format!("{}:{}", strat, profile.as_str()));
+            }
+            candidate_actions.push(strat.clone());
+        }
+
         // Consult the live Q-policy deterministically (choose_greedy):
-        // 1. Remove live random exploration (greedy selection only).
-        // 2. Restrict Q actions strictly to currently approved assigned_strategies.
         let q_action = self.q_policy.as_ref().and_then(|q| {
-            if assigned_strategies.is_empty() {
+            if candidate_actions.is_empty() {
                 None
             } else {
-                q.choose_greedy(&state_key, &assigned_strategies)
+                q.choose_greedy(&state_key, &candidate_actions)
             }
         });
+
+        let (preferred_strat, preferred_profile) = match &q_action {
+            Some(action_str) => {
+                let parts: Vec<&str> = action_str.split(':').collect();
+                let s_id = parts[0].to_string();
+                let prof = parts
+                    .get(1)
+                    .and_then(|p| th_domain::ExitPolicyProfile::from_str_name(p))
+                    .unwrap_or(th_domain::ExitPolicyProfile::Moderate);
+                (Some(s_id), Some(prof))
+            }
+            None => (None, None),
+        };
+
         let mut signals = Vec::new();
 
         for strategy in self.strategies.iter_mut() {
             if assigned_strategies.contains(&strategy.spec().id) {
-                if let Some(sig) = strategy.update(&candle, &state) {
+                if let Some(mut sig) = strategy.update(&candle, &state) {
                     // Gate long entries by Q-policy. If Q-policy has a preferred strategy for this state,
                     // prioritize it; if no action is trained yet, allow signals through to discovery.
                     let is_long_entry = matches!(
                         sig.side,
                         th_domain::SignalSide::LongCall | th_domain::SignalSide::LongPut
                     );
-                    let q_permits = match &q_action {
+                    let q_permits = match &preferred_strat {
                         Some(preferred) => preferred == &sig.strategy_id,
                         None => true,
                     };
@@ -741,9 +839,20 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                         );
                         continue;
                     }
+
+                    // Apply the learned exit policy from RL
+                    let profile =
+                        preferred_profile.unwrap_or(th_domain::ExitPolicyProfile::Moderate);
+                    let base_sl = self.cfg.stop_loss_pct.max(0.02);
+                    let (sl, tp, max_hold) = profile.params(base_sl, state.volatility);
+                    sig.proposed_stop_loss_pct = Some(sl);
+                    sig.proposed_take_profit_pct = Some(tp);
+                    sig.proposed_max_hold_minutes = Some(max_hold);
+                    sig.exit_policy = Some(profile);
+
                     println!(
-                        "SIGNAL_GENERATED symbol={} strategy_id={} side={:?} strength={:.2} q_action={:?}",
-                        sig.symbol, sig.strategy_id, sig.side, sig.strength, q_action
+                        "SIGNAL_GENERATED symbol={} strategy_id={} side={:?} strength={:.2} q_action={:?} exit_policy={:?} sl={:.2}% tp={:.2}% max_hold={}m",
+                        sig.symbol, sig.strategy_id, sig.side, sig.strength, q_action, profile, sl * 100.0, tp * 100.0, max_hold
                     );
                     signals.push(sig);
                 }
@@ -828,6 +937,7 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
             // ------------------------------------------------------------------
             enum ProtectiveStatus {
                 Working,
+                PartiallyFilled { fill_price: f64, filled_qty: u32 },
                 FilledClosed { fill_price: f64, filled_qty: u32 },
                 NeedsReplace,
             }
@@ -835,12 +945,18 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
             let protective_status = if let Some(ref pid) = t.protective_order_id {
                 match self.execution.broker_ref().get_order(pid).await {
                     Ok(pbo) => match pbo.status {
-                        th_domain::OrderStatus::New
-                        | th_domain::OrderStatus::Accepted
-                        | th_domain::OrderStatus::PartiallyFilled => ProtectiveStatus::Working,
+                        th_domain::OrderStatus::New | th_domain::OrderStatus::Accepted => {
+                            ProtectiveStatus::Working
+                        }
+                        th_domain::OrderStatus::PartiallyFilled => {
+                            let fp = pbo.filled_avg_price.unwrap_or(mark);
+                            ProtectiveStatus::PartiallyFilled {
+                                fill_price: fp,
+                                filled_qty: pbo.filled_qty,
+                            }
+                        }
                         th_domain::OrderStatus::Filled => {
                             // Protective sell filled — position is closed at broker.
-                            // Ingest as clean close; do NOT attempt to re-submit.
                             let fp = pbo.filled_avg_price.unwrap_or(mark);
                             ProtectiveStatus::FilledClosed {
                                 fill_price: fp,
@@ -869,9 +985,79 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                 ProtectiveStatus::NeedsReplace
             };
 
-            // A1: if the protective sell filled, close the trade and continue.
-            if let ProtectiveStatus::FilledClosed { fill_price: fp, filled_qty } = protective_status {
-                let pnl = (fp - t.entry_price) * filled_qty as f64 * 100.0;
+            // Point 6: Handle protective order partial fills correctly
+            if let ProtectiveStatus::PartiallyFilled {
+                fill_price: fp,
+                filled_qty,
+            } = protective_status
+            {
+                let delta_fill = filled_qty.saturating_sub(t.last_protective_filled_qty);
+                if delta_fill > 0 {
+                    let pnl = (fp - t.entry_price) * delta_fill as f64 * 100.0;
+                    self.daily_realized += pnl;
+                    let _ = self.store.checkpoint(
+                        &format!("daily_realized:{}", self.daily_key),
+                        &self.daily_realized.to_string(),
+                    );
+                    self.stats.realized_pnl += pnl;
+                    let fill = th_domain::Fill {
+                        fill_id: Uuid::new_v4(),
+                        client_order_id: Uuid::new_v4(),
+                        broker_order_id: t.protective_order_id.clone().unwrap_or_default(),
+                        symbol: t.symbol.clone(),
+                        side: OrderSide::Sell,
+                        qty: delta_fill,
+                        price: fp,
+                        fee: delta_fill as f64 * 0.65,
+                        ts: Utc::now(),
+                    };
+                    let _ = self.store.fill(&fill);
+                    if let Some(trade) = self.open_trades.get_mut(&key) {
+                        trade.qty = trade.qty.saturating_sub(delta_fill);
+                        trade.last_protective_filled_qty = filled_qty;
+                        if trade.qty == 0 {
+                            self.stats.trades_closed += 1;
+                            self.open_trades.remove(&key);
+                            let _ = self.store.delete_open_trade(&key);
+                            continue;
+                        } else {
+                            let _ = self.store.open_trade(&OpenTradeRecord {
+                                symbol: trade.symbol.clone(),
+                                underlying: trade.underlying.clone(),
+                                strategy_id: trade.strategy_id.clone(),
+                                entry_price: trade.entry_price,
+                                entry_ts: trade.entry_ts.to_rfc3339(),
+                                stop_loss_pct: trade.stop_loss_pct,
+                                take_profit_pct: trade.take_profit_pct,
+                                qty: trade.qty,
+                                protective_order_id: trade.protective_order_id.clone(),
+                                client_order_id: trade.client_order_id.map(|id| id.to_string()),
+                                entry_state: trade.entry_state.as_ref().map(|s| s.regime.clone()),
+                                quote_spread_bps: trade.quote_spread_bps,
+                                entry_slippage_bps: trade.entry_slippage_bps,
+                                exit_policy: trade
+                                    .exit_policy
+                                    .as_ref()
+                                    .map(|p| p.as_str().to_string()),
+                            });
+                        }
+                    }
+                }
+            }
+
+            // A1: if the protective sell filled, close the trade and update RL with canonical reward.
+            if let ProtectiveStatus::FilledClosed {
+                fill_price: fp,
+                filled_qty,
+            } = protective_status
+            {
+                let delta_fill = filled_qty.saturating_sub(t.last_protective_filled_qty);
+                let actual_qty = if delta_fill > 0 {
+                    delta_fill
+                } else {
+                    filled_qty
+                };
+                let pnl = (fp - t.entry_price) * actual_qty as f64 * 100.0;
                 self.daily_realized += pnl;
                 let _ = self.store.checkpoint(
                     &format!("daily_realized:{}", self.daily_key),
@@ -885,9 +1071,9 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                     broker_order_id: t.protective_order_id.clone().unwrap_or_default(),
                     symbol: t.symbol.clone(),
                     side: OrderSide::Sell,
-                    qty: filled_qty,
+                    qty: actual_qty,
                     price: fp,
-                    fee: 0.0,
+                    fee: actual_qty as f64 * 0.65 * 2.0,
                     ts: Utc::now(),
                 };
                 let _ = self.store.fill(&fill);
@@ -896,6 +1082,10 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                 } else {
                     "protective_order_filled"
                 };
+                let exit_spread = q.spread_bps();
+                let exit_slippage =
+                    ((fp - mark).abs() / mark.max(1e-9) * 10000.0).clamp(0.0, 1000.0);
+                let fees = actual_qty as f64 * 0.65 * 2.0;
                 let trade = TradeRecord {
                     trade_id: format!("TRADE-PROTECTIVE-{}", t.symbol),
                     symbol: t.underlying.clone(),
@@ -904,31 +1094,58 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                     entry: t.entry_ts,
                     exit: Some(Utc::now()),
                     pnl,
-                    fees: 0.0,
+                    fees,
                     reason: reason.into(),
                     signal_price: Some(t.entry_price),
-                    quote_spread_bps: None,
+                    quote_spread_bps: Some(exit_spread),
                     entry_fill_price: Some(t.entry_price),
                     exit_fill_price: Some(fp),
-                    slippage_bps: None,
-                    latency_ms: None,
-                    regime_at_entry: None,
+                    slippage_bps: Some(exit_slippage),
+                    latency_ms: Some(10),
+                    regime_at_entry: t.entry_state.as_ref().map(|s| s.regime.clone()),
+                    exit_policy: t.exit_policy.as_ref().map(|p| p.as_str().to_string()),
                 };
-                // Online Q-table update with the actual strategy_id as action (B-fix applied)
-                if let Some(q) = self.q_policy.as_mut() {
+
+                // Canonical Economic RL Reward (Point 5 fix)
+                let capital = t.entry_price * t.qty as f64 * 100.0;
+                let duration_mins = (Utc::now() - t.entry_ts).num_minutes().max(0) as usize;
+                let bars_held = (duration_mins / 5).max(1);
+                let reward = th_hive::compute_economic_rl_reward(
+                    pnl,
+                    capital,
+                    exit_slippage,
+                    exit_spread,
+                    fees,
+                    bars_held,
+                )
+                .composite_reward;
+
+                if let Some(q_eng) = self.q_policy.as_mut() {
                     if let Some(bars) = self.bars.get(&t.underlying) {
-                        let cur_state = th_hive::StateKey::from_state(&classify_regime(bars));
+                        let cur_state = th_hive::StateKey::from_state_with_open(
+                            &classify_regime(bars),
+                            self.market_clock.is_open(Utc::now()),
+                        );
+                        let entry_state =
+                            t.entry_state.clone().unwrap_or_else(|| cur_state.clone());
+                        let action = format!(
+                            "{}:{}",
+                            t.strategy_id,
+                            t.exit_policy
+                                .as_ref()
+                                .map(|p| p.as_str())
+                                .unwrap_or("moderate")
+                        );
                         let experience = th_hive::Experience {
-                            state: cur_state.clone(),
-                            action: t.strategy_id.clone(),
-                            reward: (pnl / (t.entry_price * t.qty as f64 * 100.0).max(1.0))
-                                .clamp(-1.0, 1.0),
+                            state: entry_state,
+                            action,
+                            reward,
                             next_state: cur_state,
                             terminal: true,
                             decision_ts: t.entry_ts,
                             outcome_ts: Utc::now(),
                         };
-                        q.update(&experience);
+                        q_eng.update(&experience);
                     }
                 }
                 self.experience.record_trade(trade.clone());
@@ -939,7 +1156,7 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                     bot_id: t.strategy_id.clone(),
                     strategy_id: t.strategy_id.clone(),
                     option_symbol: t.symbol.clone(),
-                    quantity: filled_qty,
+                    quantity: actual_qty,
                     entry_price: Some(t.entry_price),
                     exit_price: Some(fp),
                     realized_pnl: Some(pnl),
@@ -1014,6 +1231,9 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                                 protective_order_id: trade.protective_order_id.clone(),
                                 client_order_id: trade.client_order_id.map(|id| id.to_string()),
                                 entry_state: trade.entry_state.as_ref().map(|s| s.regime.clone()),
+                                quote_spread_bps: trade.quote_spread_bps,
+                                entry_slippage_bps: trade.entry_slippage_bps,
+                                exit_policy: trade.exit_policy.as_ref().map(|p| p.as_str().to_string()),
                             });
                         }
                     }
@@ -1037,12 +1257,52 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
             {
                 if let Some(ref pid) = t.protective_order_id {
                     let _ = self.execution.broker_ref().cancel(pid).await;
+                    // Point 7 fix: Verify protective order terminal status at broker
+                    for _ in 0..5 {
+                        if let Ok(pbo) = self.execution.broker_ref().get_order(pid).await {
+                            match pbo.status {
+                                th_domain::OrderStatus::Filled => {
+                                    // Filled while trying to cancel! Close trade and continue without placing duplicate market sell
+                                    let fp = pbo.filled_avg_price.unwrap_or(mark);
+                                    let pnl = (fp - t.entry_price) * pbo.filled_qty as f64 * 100.0;
+                                    self.daily_realized += pnl;
+                                    self.stats.realized_pnl += pnl;
+                                    self.stats.trades_closed += 1;
+                                    self.open_trades.remove(&key);
+                                    let _ = self.store.delete_open_trade(&key);
+                                    break;
+                                }
+                                th_domain::OrderStatus::Cancelled
+                                | th_domain::OrderStatus::Rejected
+                                | th_domain::OrderStatus::Expired => {
+                                    break;
+                                }
+                                _ => {
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(100))
+                                        .await;
+                                }
+                            }
+                        }
+                    }
+                    if !self.open_trades.contains_key(&key) {
+                        continue;
+                    }
                 }
                 let broker_positions = self
                     .execution
                     .positions()
                     .await
                     .map_err(|e| RuntimeError::Execution(e.to_string()))?;
+                let remaining_pos = broker_positions.iter().find(|p| p.symbol == t.symbol);
+                let actual_broker_qty = remaining_pos.map(|p| p.qty.unsigned_abs()).unwrap_or(0);
+                if actual_broker_qty == 0 {
+                    // Position is already flat at broker
+                    self.open_trades.remove(&key);
+                    let _ = self.store.delete_open_trade(&key);
+                    continue;
+                }
+                let exit_qty = actual_broker_qty.min(t.qty);
+
                 let acct = self
                     .execution
                     .broker()
@@ -1068,7 +1328,7 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                     client_order_id: Uuid::new_v4(),
                     symbol: t.symbol.clone(),
                     side: OrderSide::Sell,
-                    qty: t.qty,
+                    qty: exit_qty,
                     order_type: Some(exit_order_type),
                     limit_price: exit_limit_price,
                     stop_price: None,
@@ -1099,6 +1359,13 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                 {
                     continue;
                 }
+
+                // Point 23: Explicit risk exit authorization
+                let _ = self
+                    .execution
+                    .risk_mut()
+                    .authorize_exit(&order, actual_broker_qty);
+
                 let (bo, _) = match self
                     .execution
                     .execute(order.clone(), mark, spread, &portfolio)
@@ -1157,7 +1424,7 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                         side: order.side,
                         qty: bo.filled_qty,
                         price: fp,
-                        fee: 0.0,
+                        fee: bo.filled_qty as f64 * 0.65,
                         ts: Utc::now(),
                     };
                     self.store
@@ -1223,6 +1490,9 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                     let exit_now = Utc::now();
                     let latency = (exit_now - order.created_at).num_milliseconds().max(1);
                     let fees = bo.filled_qty as f64 * 0.65 * 2.0;
+                    let exit_spread = spread;
+                    let exit_slippage =
+                        ((fp - mark).abs() / mark.max(1e-9) * 10000.0).clamp(0.0, 1000.0);
                     let trade = TradeRecord {
                         trade_id: format!("TRADE-{}", order.client_order_id),
                         symbol: t.underlying.clone(),
@@ -1240,24 +1510,45 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                             "time_limit".into()
                         },
                         signal_price: Some(t.entry_price),
-                        quote_spread_bps: None,
+                        quote_spread_bps: Some(exit_spread),
                         entry_fill_price: Some(t.entry_price),
                         exit_fill_price: Some(fp),
-                        slippage_bps: Some(
-                            ((fp - mark).abs() / mark.max(1e-9) * 10000.0).clamp(0.0, 1000.0),
-                        ),
+                        slippage_bps: Some(exit_slippage),
                         latency_ms: Some(latency),
                         regime_at_entry: t.entry_state.as_ref().map(|s| s.regime.clone()),
+                        exit_policy: t.exit_policy.as_ref().map(|p| p.as_str().to_string()),
                     };
-                    // Online Q-table update: immediately reflect this trade outcome using entry state.
-                    if let Some(q) = self.q_policy.as_mut() {
+
+                    // Canonical Economic RL Reward (Point 5 fix)
+                    let capital = t.entry_price * t.qty as f64 * 100.0;
+                    let duration_mins = (exit_now - t.entry_ts).num_minutes().max(0) as usize;
+                    let bars_held = (duration_mins / 5).max(1);
+                    let reward = th_hive::compute_economic_rl_reward(
+                        pnl,
+                        capital,
+                        exit_slippage,
+                        exit_spread,
+                        fees,
+                        bars_held,
+                    )
+                    .composite_reward;
+
+                    if let Some(q_eng) = self.q_policy.as_mut() {
                         if let Some(bars) = self.bars.get(&t.underlying) {
-                            let cur_state = th_hive::StateKey::from_state(&classify_regime(bars));
-                            let entry_state = t.entry_state.clone().unwrap_or_else(|| cur_state.clone());
-                            let action = t.strategy_id.clone();
-                            let reward = (pnl
-                                / (t.entry_price * t.qty as f64 * 100.0).max(1.0))
-                                .clamp(-1.0, 1.0);
+                            let cur_state = th_hive::StateKey::from_state_with_open(
+                                &classify_regime(bars),
+                                self.market_clock.is_open(exit_now),
+                            );
+                            let entry_state =
+                                t.entry_state.clone().unwrap_or_else(|| cur_state.clone());
+                            let action = format!(
+                                "{}:{}",
+                                t.strategy_id,
+                                t.exit_policy
+                                    .as_ref()
+                                    .map(|p| p.as_str())
+                                    .unwrap_or("moderate")
+                            );
                             let experience = th_hive::Experience {
                                 state: entry_state,
                                 action,
@@ -1265,9 +1556,9 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                                 next_state: cur_state,
                                 terminal: true,
                                 decision_ts: t.entry_ts,
-                                outcome_ts: Utc::now(),
+                                outcome_ts: exit_now,
                             };
-                            q.update(&experience);
+                            q_eng.update(&experience);
                         }
                     }
                     self.experience.record_trade(trade.clone());
@@ -1311,7 +1602,16 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                                 qty: remaining.qty,
                                 protective_order_id: remaining.protective_order_id.clone(),
                                 client_order_id: remaining.client_order_id.map(|id| id.to_string()),
-                                entry_state: remaining.entry_state.as_ref().map(|s| s.regime.clone()),
+                                entry_state: remaining
+                                    .entry_state
+                                    .as_ref()
+                                    .map(|s| s.regime.clone()),
+                                quote_spread_bps: remaining.quote_spread_bps,
+                                entry_slippage_bps: remaining.entry_slippage_bps,
+                                exit_policy: remaining
+                                    .exit_policy
+                                    .as_ref()
+                                    .map(|p| p.as_str().to_string()),
                             })
                             .map_err(|e| RuntimeError::Storage(e.to_string()))?;
                     }
@@ -1416,13 +1716,15 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
             return Err(RuntimeError::NoOption);
         }
         let px = quote.ask;
-        let sl_pct = if self.cfg.stop_loss_pct > 0.0 {
-            self.cfg.stop_loss_pct
-        } else {
+        let sl_pct = sig
+            .proposed_stop_loss_pct
+            .unwrap_or(self.cfg.stop_loss_pct)
+            .clamp(0.01, self.cfg.stop_loss_pct.max(0.20));
+        if sl_pct <= 0.0 {
             return Err(RuntimeError::InvalidConfig(
                 "stop_loss_pct must be strictly positive".into(),
             ));
-        };
+        }
         let positions = self
             .execution
             .positions()
@@ -1438,7 +1740,9 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
             .broker_ref()
             .list_open_orders()
             .await
-            .map_err(|e| RuntimeError::Execution(format!("failed to query broker open orders: {e}")))?;
+            .map_err(|e| {
+                RuntimeError::Execution(format!("failed to query broker open orders: {e}"))
+            })?;
         let open_orders: Vec<OrderIntent> = broker_open_orders
             .into_iter()
             .map(|bo| OrderIntent {
@@ -1622,7 +1926,13 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
         }
         let (bo, _approval) = match self
             .execution
-            .execute(order.clone(), px, quote.spread_bps(), &portfolio)
+            .execute_with_stop(
+                order.clone(),
+                px,
+                quote.spread_bps(),
+                &portfolio,
+                Some(sl_pct),
+            )
             .await
         {
             Ok(v) => {
@@ -1750,19 +2060,12 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                 // we must submit a separate sell-to-close limit order post-fill.
                 // A4: Use deterministic client_order_id so crash recovery can find
                 // this order at the broker without double-submitting.
-                // Adaptive / dynamic stop loss proposed by policy or signal, evaluated within safety envelope
-                let dynamic_stop_loss = sig.proposed_stop_loss_pct.unwrap_or_else(|| {
-                    let reg = classify_regime(self.bars.get(&sig.symbol).map(|b| b.as_slice()).unwrap_or(&[]));
-                    if reg.volatility > 0.02 {
-                        (self.cfg.stop_loss_pct * 1.25).min(0.12)
-                    } else if reg.volatility > 0.0 && reg.volatility < 0.008 {
-                        (self.cfg.stop_loss_pct * 0.75).max(0.02)
-                    } else {
-                        self.cfg.stop_loss_pct
-                    }
-                }).clamp(0.01, self.cfg.stop_loss_pct.max(0.15));
-
-                let dynamic_take_profit = sig.proposed_take_profit_pct.unwrap_or(dynamic_stop_loss * 2.5).clamp(0.02, 1.0);
+                // Sizing and broker protective stop use the exact same learned & approved stop-loss
+                let dynamic_stop_loss = sl_pct;
+                let dynamic_take_profit = sig
+                    .proposed_take_profit_pct
+                    .unwrap_or(dynamic_stop_loss * 2.0)
+                    .clamp(0.02, 1.0);
 
                 let sl_price = (fp * (1.0 - dynamic_stop_loss)).max(0.01);
                 let protective_cid = protective_order_id_from_entry(
@@ -1789,6 +2092,13 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                     option_action: Some(OptionOrderAction::SellToClose),
                 };
                 protective_intent.order_hash = order_hash(&protective_intent);
+
+                // Point 23: Explicit risk exit authorization for protective order
+                let _exit_approval = self
+                    .execution
+                    .risk_mut()
+                    .authorize_exit(&protective_intent, bo.filled_qty);
+
                 let protective_broker_id = match self
                     .execution
                     .broker_ref()
@@ -1803,8 +2113,6 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                         Some(pbo.broker_order_id)
                     }
                     Err(e) => {
-                        // Soft failure: the process-level manage_open_trade exit loop
-                        // remains the safety net. The position is not abandoned.
                         println!(
                             "PROTECTIVE_ORDER_FAILED symbol={} stop_price={:.2} error={}",
                             order.symbol, sl_price, e
@@ -1812,9 +2120,17 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                         None
                     }
                 };
-                let entry_state = th_hive::StateKey::from_state(&classify_regime(
-                    self.bars.get(&sig.symbol).map(|b| b.as_slice()).unwrap_or(&[]),
-                ));
+                let entry_state = th_hive::StateKey::from_state_with_open(
+                    &classify_regime(
+                        self.bars
+                            .get(&sig.symbol)
+                            .map(|b| b.as_slice())
+                            .unwrap_or(&[]),
+                    ),
+                    self.market_clock.is_open(Utc::now()),
+                );
+                let entry_slippage_bps =
+                    ((fp - px).abs() / px.max(1e-9) * 10000.0).clamp(0.0, 1000.0);
                 let opened = OpenTrade {
                     symbol: order.symbol.clone(),
                     underlying: sig.symbol.clone(),
@@ -1827,6 +2143,10 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                     protective_order_id: protective_broker_id,
                     client_order_id: Some(order.client_order_id),
                     entry_state: Some(entry_state),
+                    quote_spread_bps: Some(quote.spread_bps()),
+                    entry_slippage_bps: Some(entry_slippage_bps),
+                    exit_policy: sig.exit_policy,
+                    last_protective_filled_qty: 0,
                 };
                 self.store
                     .open_trade(&OpenTradeRecord {
@@ -1841,12 +2161,17 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                         protective_order_id: opened.protective_order_id.clone(),
                         client_order_id: opened.client_order_id.map(|id| id.to_string()),
                         entry_state: opened.entry_state.as_ref().map(|s| s.regime.clone()),
+                        quote_spread_bps: opened.quote_spread_bps,
+                        entry_slippage_bps: opened.entry_slippage_bps,
+                        exit_policy: opened.exit_policy.as_ref().map(|p| p.as_str().to_string()),
                     })
                     .map_err(|e| RuntimeError::Storage(e.to_string()))?;
                 if let Some(existing) = self.open_trades.get_mut(&order.symbol) {
                     let total_qty = existing.qty + bo.filled_qty;
                     if total_qty > 0 {
-                        existing.entry_price = (existing.entry_price * existing.qty as f64 + fp * bo.filled_qty as f64) / total_qty as f64;
+                        existing.entry_price = (existing.entry_price * existing.qty as f64
+                            + fp * bo.filled_qty as f64)
+                            / total_qty as f64;
                         existing.qty = total_qty;
                         if opened.protective_order_id.is_some() {
                             existing.protective_order_id = opened.protective_order_id.clone();
@@ -1923,6 +2248,9 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                             ts: Utc::now(),
                         };
                         let _ = self.store.fill(&fill);
+                        let spread_bps = t.quote_spread_bps.unwrap_or(10.0);
+                        let slippage_bps = t.entry_slippage_bps.unwrap_or(0.0);
+                        let fees = pbo.filled_qty as f64 * 0.65 * 2.0;
                         let trade = TradeRecord {
                             trade_id: format!("TRADE-RECONCILED-PROTECTIVE-{}", t.symbol),
                             symbol: t.underlying.clone(),
@@ -1931,15 +2259,16 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                             entry: t.entry_ts,
                             exit: Some(Utc::now()),
                             pnl,
-                            fees: 0.0,
+                            fees,
                             reason: "protective_order_filled_during_reconciliation".into(),
                             signal_price: Some(t.entry_price),
-                            quote_spread_bps: None,
+                            quote_spread_bps: Some(spread_bps),
                             entry_fill_price: Some(t.entry_price),
                             exit_fill_price: Some(fp),
-                            slippage_bps: None,
+                            slippage_bps: Some(slippage_bps),
                             latency_ms: None,
-                            regime_at_entry: None,
+                            regime_at_entry: t.entry_state.as_ref().map(|s| s.regime.clone()),
+                            exit_policy: t.exit_policy.as_ref().map(|p| p.as_str().to_string()),
                         };
                         self.experience.record_trade(trade);
                         self.open_trades.remove(&key);
@@ -2102,6 +2431,9 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                             protective_order_id: trade.protective_order_id.clone(),
                             client_order_id: trade.client_order_id.map(|id| id.to_string()),
                             entry_state: trade.entry_state.as_ref().map(|s| s.regime.clone()),
+                            quote_spread_bps: trade.quote_spread_bps,
+                            entry_slippage_bps: trade.entry_slippage_bps,
+                            exit_policy: trade.exit_policy.as_ref().map(|p| p.as_str().to_string()),
                         });
                     }
                 }
@@ -2466,7 +2798,11 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
         // Connect actual promoted strategies from the research bundle to the active runtime
         let promoted_strats = strategies_from_report(&bundle);
         for s in promoted_strats {
-            if !self.strategies.iter().any(|existing| existing.spec().id == s.spec().id) {
+            if !self
+                .strategies
+                .iter()
+                .any(|existing| existing.spec().id == s.spec().id)
+            {
                 println!("STRATEGY_CONNECTED_TO_RUNTIME strategy_id={}", s.spec().id);
                 self.strategies.push(s);
             }
@@ -2739,14 +3075,18 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
         // Use previous session's trade records for pre-market analysis context.
         let prior_session_id = prior_rl.as_ref().map(|r| r.session_id.clone());
         let trade_records = if let Some(ref sid) = prior_session_id {
-            self.store
-                .trade_records_for_session(sid)
-                .unwrap_or_default()
+            self.store.trade_records_for_session(sid).map_err(|e| {
+                RuntimeError::Storage(format!(
+                    "failed to load trade records for session {sid}: {e}"
+                ))
+            })?
         } else {
             // First ever run: scan last 7 days as bootstrap
             self.store
                 .trade_records_since(&(now - chrono::Duration::days(7)).to_rfc3339())
-                .unwrap_or_default()
+                .map_err(|e| {
+                    RuntimeError::Storage(format!("failed to load bootstrap trade records: {e}"))
+                })?
         };
         let portfolio = self
             .execution
@@ -2938,6 +3278,12 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                     let _ = self.store.fill(&fill);
                     let fees = bo.filled_qty as f64 * 0.65 * 2.0;
                     let latency = (Utc::now() - order.created_at).num_milliseconds().max(1);
+                    let spread_bps = t.quote_spread_bps.unwrap_or(10.0);
+                    let slippage_bps = if mark > 0.0 {
+                        ((fp - mark).abs() / mark * 10_000.0).min(500.0)
+                    } else {
+                        t.entry_slippage_bps.unwrap_or(0.0)
+                    };
                     let trade = TradeRecord {
                         trade_id: format!("TRADE-EOD-{}-{}", session_id, t.symbol),
                         symbol: t.underlying.clone(),
@@ -2949,12 +3295,13 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                         fees,
                         reason: "session_end".into(),
                         signal_price: Some(t.entry_price),
-                        quote_spread_bps: None,
+                        quote_spread_bps: Some(spread_bps),
                         entry_fill_price: Some(t.entry_price),
                         exit_fill_price: Some(fp),
-                        slippage_bps: Some(0.0),
+                        slippage_bps: Some(slippage_bps),
                         latency_ms: Some(latency),
                         regime_at_entry: t.entry_state.as_ref().map(|s| s.regime.clone()),
+                        exit_policy: t.exit_policy.as_ref().map(|p| p.as_str().to_string()),
                     };
                     self.experience.record_trade(trade.clone());
                     let autopsy = self.experience.autopsy(&trade);
@@ -3010,6 +3357,9 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                         protective_order_id: remaining.protective_order_id.clone(),
                         client_order_id: remaining.client_order_id.map(|id| id.to_string()),
                         entry_state: remaining.entry_state.as_ref().map(|s| s.regime.clone()),
+                        quote_spread_bps: remaining.quote_spread_bps,
+                        entry_slippage_bps: remaining.entry_slippage_bps,
+                        exit_policy: remaining.exit_policy.as_ref().map(|p| p.as_str().to_string()),
                     });
                     println!(
                         "POSITION_PARTIALLY_CLOSED symbol={} underlying={} filled_qty={} remaining_qty={} pnl={:.2}",
@@ -3088,9 +3438,13 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                 )));
             }
         }
-        let account = self.execution.broker().await.ok();
-        let equity = account.as_ref().map(|a| a.equity).unwrap_or(0.0);
-        let cash = account.as_ref().map(|a| a.cash).unwrap_or(0.0);
+        let account = self.execution.broker().await.map_err(|e| {
+            RuntimeError::Execution(format!(
+                "broker account retrieval failed at post-market: {e}"
+            ))
+        })?;
+        let equity = account.equity;
+        let cash = account.cash;
 
         let dataset = serde_json::json!({
             "session_id": session_id,
@@ -3133,7 +3487,11 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
         let trade_records = self
             .store
             .trade_records_for_session(session_id)
-            .unwrap_or_default();
+            .map_err(|e| {
+                RuntimeError::Storage(format!(
+                    "failed to load trade records for session {session_id}: {e}"
+                ))
+            })?;
 
         if trade_records.is_empty() {
             println!(

@@ -1638,6 +1638,7 @@ dependencies = [
  "chrono-tz",
  "clap",
  "dotenvy",
+ "reqwest",
  "serde_json",
  "th-bot",
  "th-deployment",

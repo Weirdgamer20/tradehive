@@ -422,6 +422,7 @@ fn test_underlying_vs_option_backtest_divergence() {
                     proposed_stop_loss_pct: None,
                     proposed_take_profit_pct: None,
                     proposed_max_hold_minutes: None,
+                    exit_policy: None,
                 })
             } else {
                 None

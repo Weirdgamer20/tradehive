@@ -27,7 +27,8 @@ impl OptionQuote {
         Ok((self.bid + self.ask) / 2.0)
     }
     pub fn is_stale(&self, now: DateTime<Utc>, max_age_secs: i64) -> bool {
-        now.signed_duration_since(self.as_of).num_seconds() > max_age_secs
+        let diff = now.signed_duration_since(self.as_of).num_seconds();
+        diff < 0 || diff > max_age_secs
     }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]

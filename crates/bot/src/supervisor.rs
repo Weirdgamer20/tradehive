@@ -1493,6 +1493,16 @@ impl<'a, B: th_execution::Broker, P: th_market_data::MarketDataProvider> HiveSup
             Err(e) => println!("RECONCILIATION_FAILED phase=shutdown error={}", e),
         }
 
+        if !self.runtime.open_trades.is_empty() {
+            println!(
+                "SHUTDOWN_OPEN_TRADES_DETECTED count={} initiating_emergency_liquidation",
+                self.runtime.open_trades.len()
+            );
+            if let Err(e) = self.runtime.emergency_liquidate_all().await {
+                println!("SHUTDOWN_LIQUIDATION_FAILED error={}", e);
+            }
+        }
+
         if let Err(e) = self.persist_checkpoint_critical() {
             println!("CHECKPOINT_PERSIST_FAILED phase=shutdown error={}", e);
         }

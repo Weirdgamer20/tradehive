@@ -27,6 +27,8 @@ pub struct TradeRecord {
     pub latency_ms: Option<i64>,
     #[serde(default)]
     pub regime_at_entry: Option<String>,
+    #[serde(default)]
+    pub exit_policy: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,8 +100,9 @@ impl ExperienceStore {
         let exec_attribution = -exec_friction;
         let alpha_attribution = t.pnl + exec_friction;
 
-        let exec_score = (1.0 - (slippage / 50.0).clamp(0.0, 1.0) - (spread / 100.0).clamp(0.0, 0.5))
-            .clamp(0.0, 1.0);
+        let exec_score =
+            (1.0 - (slippage / 50.0).clamp(0.0, 1.0) - (spread / 100.0).clamp(0.0, 0.5))
+                .clamp(0.0, 1.0);
         let signal_score = ((t.pnl / notional.max(10.0)).clamp(-1.0, 1.0) + 1.0) / 2.0;
         let option_selection_score = (1.0 - (spread / 200.0)).clamp(0.0, 1.0);
 

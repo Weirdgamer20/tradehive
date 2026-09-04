@@ -161,11 +161,13 @@ impl PortfolioRisk {
         1.0
     }
     pub fn total_notional(&self) -> f64 {
-        let pos_notional: f64 = self.positions
+        let pos_notional: f64 = self
+            .positions
             .iter()
             .map(|p| p.mark.abs() * p.qty.unsigned_abs() as f64 * CONTRACT_MULTIPLIER)
             .sum();
-        let orders_notional: f64 = self.open_orders
+        let orders_notional: f64 = self
+            .open_orders
             .iter()
             .filter(|o| !o.reduce_only)
             .map(|o| o.qty as f64 * self.resolve_order_price(o) * CONTRACT_MULTIPLIER)
@@ -174,12 +176,14 @@ impl PortfolioRisk {
     }
     pub fn underlying_notional(&self, symbol_or_underlying: &str) -> f64 {
         let target = underlying_from_symbol(symbol_or_underlying);
-        let pos_notional: f64 = self.positions
+        let pos_notional: f64 = self
+            .positions
             .iter()
             .filter(|p| underlying_from_symbol(&p.symbol) == target)
             .map(|p| p.mark.abs() * p.qty.unsigned_abs() as f64 * CONTRACT_MULTIPLIER)
             .sum();
-        let orders_notional: f64 = self.open_orders
+        let orders_notional: f64 = self
+            .open_orders
             .iter()
             .filter(|o| !o.reduce_only && underlying_from_symbol(&o.symbol) == target)
             .map(|o| o.qty as f64 * self.resolve_order_price(o) * CONTRACT_MULTIPLIER)
@@ -262,6 +266,17 @@ impl RiskGovernor {
         spread_bps: f64,
         portfolio: &PortfolioRisk,
     ) -> Result<RiskApproval, RiskError> {
+        self.authorize_with_stop(order, price, spread_bps, portfolio, None)
+    }
+
+    pub fn authorize_with_stop(
+        &mut self,
+        order: &OrderIntent,
+        price: f64,
+        spread_bps: f64,
+        portfolio: &PortfolioRisk,
+        proposed_stop_loss_pct: Option<f64>,
+    ) -> Result<RiskApproval, RiskError> {
         order
             .validate()
             .map_err(|e| RiskError::Invalid(e.to_string()))?;
@@ -335,15 +350,19 @@ impl RiskGovernor {
         if !order.reduce_only && portfolio.open_positions() >= self.limits.max_positions {
             return Err(RiskError::Limit("MAX_POSITIONS".into()));
         }
-        // E3: Enforce loss-at-risk against max_trade_risk_pct
+        // E3: Enforce loss-at-risk against max_trade_risk_pct using exact proposed stop loss
         let equity = portfolio.cash + portfolio.total_notional();
         if equity > 0.0 && !order.reduce_only {
             let max_trade_loss = equity * self.limits.max_trade_risk_pct;
-            let stop_fraction = self
-                .strategy_risks
-                .get(&order.strategy_id)
-                .map(|s| s.risk_pct)
-                .unwrap_or(0.20);
+            let strat_risk = self.strategy_risks.get(&order.strategy_id).ok_or_else(|| {
+                RiskError::Limit(format!(
+                    "STRATEGY_RISK_CONFIG_MISSING: {}",
+                    order.strategy_id
+                ))
+            })?;
+            let stop_fraction = proposed_stop_loss_pct
+                .unwrap_or(strat_risk.risk_pct)
+                .max(strat_risk.risk_pct);
             let proposed_loss = n * stop_fraction;
             if proposed_loss > max_trade_loss {
                 return Err(RiskError::Limit("MAX_TRADE_RISK_EXCEEDED".into()));
@@ -363,6 +382,44 @@ impl RiskGovernor {
             client_order_id: order.client_order_id,
             order_hash: order.order_hash.clone(),
             reason: "APPROVED".into(),
+        };
+        self.tokens.insert(a.token, a.clone());
+        Ok(a)
+    }
+
+    /// Explicit exit authorization policy (Point 23): Governs protective and closing orders
+    /// ensuring exit quantity does not exceed position quantity, side is sell, and preventing duplicate exits.
+    pub fn authorize_exit(
+        &mut self,
+        order: &OrderIntent,
+        position_qty: u32,
+    ) -> Result<RiskApproval, RiskError> {
+        order
+            .validate()
+            .map_err(|e| RiskError::Invalid(e.to_string()))?;
+        if order.order_hash.len() != 64 || !order.order_hash.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Err(RiskError::Invalid("order hash missing or malformed".into()));
+        }
+        if order.qty == 0 || order.qty > position_qty {
+            return Err(RiskError::Limit(format!(
+                "EXIT_QTY_EXCEEDS_POSITION: order_qty={} pos_qty={}",
+                order.qty, position_qty
+            )));
+        }
+        if !order.reduce_only && order.side != th_domain::OrderSide::Sell {
+            return Err(RiskError::Invalid(
+                "exit order must be reduce_only or sell".into(),
+            ));
+        }
+        let now = Utc::now();
+        let a = RiskApproval {
+            token: Uuid::new_v4(),
+            approved_at: now,
+            expires_at: now + Duration::seconds(30),
+            client_order_id: order.client_order_id,
+            order_hash: order.order_hash.clone(),
+            reason: "EXIT_APPROVED".into(),
         };
         self.tokens.insert(a.token, a.clone());
         Ok(a)

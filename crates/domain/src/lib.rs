@@ -293,6 +293,62 @@ pub struct Signal {
     pub proposed_take_profit_pct: Option<f64>,
     #[serde(default)]
     pub proposed_max_hold_minutes: Option<u32>,
+    #[serde(default)]
+    pub exit_policy: Option<ExitPolicyProfile>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum ExitPolicyProfile {
+    Tight,
+    Moderate,
+    Wide,
+    #[default]
+    Adaptive,
+}
+
+impl ExitPolicyProfile {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Tight => "tight",
+            Self::Moderate => "moderate",
+            Self::Wide => "wide",
+            Self::Adaptive => "adaptive",
+        }
+    }
+
+    pub fn from_str_name(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "tight" => Some(Self::Tight),
+            "moderate" => Some(Self::Moderate),
+            "wide" => Some(Self::Wide),
+            "adaptive" => Some(Self::Adaptive),
+            _ => None,
+        }
+    }
+
+    pub fn all() -> &'static [Self] {
+        &[Self::Tight, Self::Moderate, Self::Wide, Self::Adaptive]
+    }
+
+    pub fn params(&self, base_sl: f64, vol: f64) -> (f64, f64, u32) {
+        match self {
+            Self::Tight => (0.03, 0.06, 45),
+            Self::Moderate => (0.05, 0.12, 90),
+            Self::Wide => (0.08, 0.20, 180),
+            Self::Adaptive => {
+                let sl = if vol > 0.02 {
+                    (base_sl * 1.25).clamp(0.04, 0.12)
+                } else if vol > 0.0 && vol < 0.008 {
+                    (base_sl * 0.75).clamp(0.02, 0.06)
+                } else {
+                    base_sl.clamp(0.02, 0.10)
+                };
+                let tp = (sl * 2.5).clamp(0.05, 0.30);
+                let hold = if vol > 0.02 { 60 } else { 120 };
+                (sl, tp, hold)
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -504,17 +560,23 @@ impl OrderIntent {
         match self.resolved_order_type() {
             OrderType::Stop => {
                 if self.stop_price.is_none() {
-                    return Err(DomainError::Invalid("stop order requires stop_price".into()));
+                    return Err(DomainError::Invalid(
+                        "stop order requires stop_price".into(),
+                    ));
                 }
             }
             OrderType::StopLimit => {
                 if self.stop_price.is_none() || self.limit_price.is_none() {
-                    return Err(DomainError::Invalid("stop-limit order requires stop_price and limit_price".into()));
+                    return Err(DomainError::Invalid(
+                        "stop-limit order requires stop_price and limit_price".into(),
+                    ));
                 }
             }
             OrderType::Limit => {
                 if self.limit_price.is_none() {
-                    return Err(DomainError::Invalid("limit order requires limit_price".into()));
+                    return Err(DomainError::Invalid(
+                        "limit order requires limit_price".into(),
+                    ));
                 }
             }
             OrderType::Market => {}
@@ -795,6 +857,33 @@ pub fn validate_point_in_time_event(
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionCostModel {
+    pub fee_per_contract: f64,
+    pub spread_bps: f64,
+    pub slippage_bps: f64,
+    pub market_impact_bps: f64,
+    pub latency_ms: i64,
+}
+
+impl Default for ExecutionCostModel {
+    fn default() -> Self {
+        Self {
+            fee_per_contract: 0.65,
+            spread_bps: 10.0,
+            slippage_bps: 5.0,
+            market_impact_bps: 2.0,
+            latency_ms: 100,
+        }
+    }
+}
+
+impl ExecutionCostModel {
+    pub fn research_scenarios() -> &'static [(f64, f64)] {
+        &[(1.0, 1.0), (1.5, 2.0), (3.0, 5.0), (5.0, 8.0)]
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

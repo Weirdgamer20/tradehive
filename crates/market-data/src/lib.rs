@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, Utc};
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -252,9 +252,14 @@ fn parse_ts(s: &str) -> Result<DateTime<Utc>, MarketDataError> {
         .map_err(|e| MarketDataError::Decode(e.to_string()))
 }
 fn parse_occ_expiry(symbol: &str) -> Option<DateTime<Utc>> {
+    use chrono::TimeZone;
     let p = th_domain::occ::parse(symbol)?;
-    Utc.with_ymd_and_hms(p.year as i32, p.month, p.day, 16, 0, 0)
+    let naive_date = chrono::NaiveDate::from_ymd_opt(p.year as i32, p.month, p.day)?;
+    let naive_dt = naive_date.and_hms_opt(16, 0, 0)?; // 4:00 PM Eastern Time expiration
+    chrono_tz::America::New_York
+        .from_local_datetime(&naive_dt)
         .single()
+        .map(|dt| dt.with_timezone(&Utc))
 }
 #[async_trait]
 impl MarketDataProvider for AlpacaProvider {
@@ -405,11 +410,18 @@ impl MarketDataProvider for AlpacaProvider {
                 _ => break,
             }
         }
+        let spot = match self
+            .bars(underlying, as_of - chrono::Duration::minutes(15), as_of)
+            .await
+        {
+            Ok(bars) => bars.last().map(|b| b.close),
+            Err(_) => None,
+        };
         Ok(OptionChain {
             underlying: underlying.into(),
             as_of,
             quotes,
-            underlying_spot: None,
+            underlying_spot: spot,
         })
     }
     async fn news(

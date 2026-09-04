@@ -250,13 +250,15 @@ fn signal(
         strength: strength.clamp(0.0, 1.0),
         reason: reason.into(),
         generated_at: Utc::now(),
-        config_version: "production-v1".into(),
+        config_version: std::env::var("TRADING_HIVE_CONFIG_VERSION")
+            .unwrap_or_else(|_| "production-v1".into()),
         session_id: None,
         bot_id: None,
         candidate_id: None,
         proposed_stop_loss_pct: None,
         proposed_take_profit_pct: None,
         proposed_max_hold_minutes: None,
+        exit_policy: None,
     }
 }
 

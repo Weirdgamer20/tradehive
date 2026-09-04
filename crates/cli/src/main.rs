@@ -57,8 +57,17 @@ async fn run_autonomous(max_ticks: Option<usize>) -> Result<(), Box<dyn std::err
     let data_url = require_env("ALPACA_DATA_URL")?;
     let trading_url = require_env("ALPACA_TRADING_URL")?;
 
-    let is_paper = trading_url.contains("paper-api.alpaca.markets");
-    let is_live = !is_paper && trading_url.contains("api.alpaca.markets");
+    let parsed_url = reqwest::Url::parse(&trading_url)
+        .map_err(|e| format!("Invalid ALPACA_TRADING_URL {trading_url}: {e}"))?;
+    let host = parsed_url.host_str().unwrap_or("");
+    let is_paper = host == "paper-api.alpaca.markets" || host == "localhost" || host == "127.0.0.1";
+    let is_live = host == "api.alpaca.markets";
+
+    if !is_paper && !is_live {
+        return Err(format!(
+            "Unrecognized Alpaca trading endpoint host: '{host}'. Must be exact 'api.alpaca.markets' (live) or 'paper-api.alpaca.markets' (paper)"
+        ).into());
+    }
 
     if is_live && std::env::var("TRADING_HIVE_LIVE_CONFIRM").as_deref() != Ok("YES") {
         return Err(

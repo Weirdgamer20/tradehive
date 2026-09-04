@@ -26,6 +26,12 @@ pub struct OpenTradeRecord {
     pub client_order_id: Option<String>,
     #[serde(default)]
     pub entry_state: Option<String>,
+    #[serde(default)]
+    pub quote_spread_bps: Option<f64>,
+    #[serde(default)]
+    pub entry_slippage_bps: Option<f64>,
+    #[serde(default)]
+    pub exit_policy: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -130,6 +136,56 @@ impl Store {
                 "entry_state",
                 "ALTER TABLE open_trades ADD COLUMN entry_state TEXT",
             ),
+            (
+                "open_trades",
+                "quote_spread_bps",
+                "ALTER TABLE open_trades ADD COLUMN quote_spread_bps REAL",
+            ),
+            (
+                "open_trades",
+                "entry_slippage_bps",
+                "ALTER TABLE open_trades ADD COLUMN entry_slippage_bps REAL",
+            ),
+            (
+                "open_trades",
+                "exit_policy",
+                "ALTER TABLE open_trades ADD COLUMN exit_policy TEXT",
+            ),
+            (
+                "orders",
+                "order_type",
+                "ALTER TABLE orders ADD COLUMN order_type TEXT",
+            ),
+            (
+                "orders",
+                "stop_price",
+                "ALTER TABLE orders ADD COLUMN stop_price REAL",
+            ),
+            (
+                "orders",
+                "option_action",
+                "ALTER TABLE orders ADD COLUMN option_action TEXT",
+            ),
+            (
+                "orders",
+                "oms_state",
+                "ALTER TABLE orders ADD COLUMN oms_state TEXT",
+            ),
+            (
+                "orders",
+                "bot_id",
+                "ALTER TABLE orders ADD COLUMN bot_id TEXT",
+            ),
+            (
+                "orders",
+                "session_id",
+                "ALTER TABLE orders ADD COLUMN session_id TEXT",
+            ),
+            (
+                "orders",
+                "decision_id",
+                "ALTER TABLE orders ADD COLUMN decision_id TEXT",
+            ),
         ] {
             let exists = self
                 .conn
@@ -166,7 +222,29 @@ impl Store {
         broker_id: Option<&str>,
         status: Option<&str>,
     ) -> Result<(), StorageError> {
-        self.conn.execute("INSERT OR IGNORE INTO orders(client_order_id,symbol,side,qty,limit_price,reduce_only,strategy_id,created_at,order_hash,broker_order_id,status) VALUES(?,?,?,?,?,?,?,?,?,?,?)",params![o.client_order_id.to_string(),o.symbol,format!("{:?}",o.side),o.qty,o.limit_price,if o.reduce_only{1}else{0},o.strategy_id,o.created_at.to_rfc3339(),o.order_hash,broker_id,status])?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO orders(client_order_id,symbol,side,qty,limit_price,reduce_only,strategy_id,created_at,order_hash,broker_order_id,status,order_type,stop_price,option_action,oms_state,bot_id,session_id,decision_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            params![
+                o.client_order_id.to_string(),
+                o.symbol,
+                format!("{:?}", o.side),
+                o.qty,
+                o.limit_price,
+                if o.reduce_only { 1 } else { 0 },
+                o.strategy_id,
+                o.created_at.to_rfc3339(),
+                o.order_hash,
+                broker_id,
+                status,
+                o.order_type.map(|t| format!("{:?}", t)),
+                o.stop_price,
+                o.option_action.map(|a| a.as_str().to_string()),
+                o.oms_state.map(|s| format!("{:?}", s)),
+                o.bot_id,
+                o.session_id,
+                o.decision_id.map(|d| d.to_string()),
+            ],
+        )?;
         Ok(())
     }
     pub fn update_order_status(
@@ -184,7 +262,7 @@ impl Store {
     }
     pub fn open_trade(&self, trade: &OpenTradeRecord) -> Result<(), StorageError> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO open_trades(symbol,underlying,strategy_id,entry_price,entry_ts,stop_loss_pct,take_profit_pct,qty,protective_order_id,client_order_id,entry_state) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT OR REPLACE INTO open_trades(symbol,underlying,strategy_id,entry_price,entry_ts,stop_loss_pct,take_profit_pct,qty,protective_order_id,client_order_id,entry_state,quote_spread_bps,entry_slippage_bps,exit_policy) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![
                 trade.symbol,
                 trade.underlying,
@@ -197,6 +275,9 @@ impl Store {
                 trade.protective_order_id,
                 trade.client_order_id,
                 trade.entry_state,
+                trade.quote_spread_bps,
+                trade.entry_slippage_bps,
+                trade.exit_policy,
             ],
         )?;
         Ok(())
@@ -208,7 +289,7 @@ impl Store {
     }
     pub fn load_open_trades(&self) -> Result<Vec<OpenTradeRecord>, StorageError> {
         let mut st = self.conn.prepare(
-            "SELECT symbol,underlying,strategy_id,entry_price,entry_ts,stop_loss_pct,take_profit_pct,qty,protective_order_id,client_order_id,entry_state FROM open_trades",
+            "SELECT symbol,underlying,strategy_id,entry_price,entry_ts,stop_loss_pct,take_profit_pct,qty,protective_order_id,client_order_id,entry_state,quote_spread_bps,entry_slippage_bps,exit_policy FROM open_trades",
         )?;
         let rows = st.query_map([], |r| {
             Ok(OpenTradeRecord {
@@ -223,6 +304,9 @@ impl Store {
                 protective_order_id: r.get(8)?,
                 client_order_id: r.get(9)?,
                 entry_state: r.get(10)?,
+                quote_spread_bps: r.get(11)?,
+                entry_slippage_bps: r.get(12)?,
+                exit_policy: r.get(13)?,
             })
         })?;
         let mut out = Vec::new();

@@ -61,6 +61,14 @@ pub struct BrokerOrder {
     pub side: Option<OrderSide>,
     #[serde(default)]
     pub limit_price: Option<f64>,
+    #[serde(default)]
+    pub order_type: Option<th_domain::OrderType>,
+    #[serde(default)]
+    pub stop_price: Option<f64>,
+    #[serde(default)]
+    pub time_in_force: Option<String>,
+    #[serde(default)]
+    pub position_intent: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountSnapshot {
@@ -133,6 +141,45 @@ impl PaperBroker {
             state.positions.insert(p.symbol.clone(), p);
         }
     }
+    pub fn update_mark(&self, symbol: &str, new_price: f64) {
+        if let Ok(mut s) = self.inner.lock() {
+            if let Some(pos) = s.positions.get_mut(symbol) {
+                pos.mark = new_price;
+            }
+            let slip_bps = s.config.slippage_bps;
+            let spread_bps = s.config.spread_bps;
+            let to_trigger: Vec<Uuid> = s
+                .orders
+                .iter()
+                .filter(|(_, bo)| {
+                    bo.status == OrderStatus::Accepted
+                        && bo.order_type == Some(th_domain::OrderType::Stop)
+                        && bo.symbol.as_deref() == Some(symbol)
+                        && bo.stop_price.map(|sp| new_price <= sp).unwrap_or(false)
+                })
+                .map(|(cid, _)| *cid)
+                .collect();
+
+            for cid in to_trigger {
+                if let Some(bo) = s.orders.get_mut(&cid) {
+                    let fill_qty = bo.qty.unwrap_or(0);
+                    let px = new_price * (1.0 - (slip_bps + spread_bps / 2.0) / 10_000.0);
+                    bo.status = OrderStatus::Filled;
+                    bo.filled_qty = fill_qty;
+                    bo.filled_avg_price = Some(px);
+                    let cash_delta = px * fill_qty as f64 * CONTRACT_MULTIPLIER;
+                    s.cash += cash_delta;
+                    if let Some(e) = s.positions.get_mut(symbol) {
+                        e.qty -= fill_qty as i32;
+                        e.mark = px;
+                        if e.qty <= 0 {
+                            s.positions.remove(symbol);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 #[async_trait]
 impl Broker for PaperBroker {
@@ -148,31 +195,25 @@ impl Broker for PaperBroker {
         }
 
         let base_px = match o.resolved_order_type() {
-            th_domain::OrderType::Limit | th_domain::OrderType::StopLimit => o
-                .limit_price
-                .ok_or_else(|| ExecutionError::Invalid("limit/stop-limit order requires limit price".into()))?,
+            th_domain::OrderType::Limit | th_domain::OrderType::StopLimit => {
+                o.limit_price.ok_or_else(|| {
+                    ExecutionError::Invalid("limit/stop-limit order requires limit price".into())
+                })?
+            }
             th_domain::OrderType::Stop => o
                 .stop_price
                 .ok_or_else(|| ExecutionError::Invalid("stop order requires stop price".into()))?,
-            th_domain::OrderType::Market => {
-                s.positions.get(&o.symbol).map(|p| p.mark.abs().max(0.01)).unwrap_or_else(|| {
-                    o.limit_price.or(o.stop_price).unwrap_or(1.0)
-                })
-            }
+            th_domain::OrderType::Market => s
+                .positions
+                .get(&o.symbol)
+                .map(|p| p.mark.abs().max(0.01))
+                .unwrap_or_else(|| o.limit_price.or(o.stop_price).unwrap_or(1.0)),
         };
         if !base_px.is_finite() || base_px <= 0.0 {
             return Err(ExecutionError::Invalid(
                 "invalid paper execution price".into(),
             ));
         }
-
-        // Apply realistic slippage & spread crossing
-        let slip_bps = s.config.slippage_bps;
-        let spread_bps = s.config.spread_bps;
-        let px = match o.side {
-            OrderSide::Buy => base_px * (1.0 + (slip_bps + spread_bps / 2.0) / 10_000.0),
-            OrderSide::Sell => base_px * (1.0 - (slip_bps + spread_bps / 2.0) / 10_000.0),
-        };
 
         let existing_qty = s.positions.get(&o.symbol).map(|p| p.qty).unwrap_or(0);
         if o.reduce_only && o.side != OrderSide::Sell {
@@ -190,6 +231,49 @@ impl Broker for PaperBroker {
                 "naked option sells are disabled".into(),
             ));
         }
+
+        let is_stop = o.resolved_order_type() == th_domain::OrderType::Stop;
+        let current_mark = s
+            .positions
+            .get(&o.symbol)
+            .map(|p| p.mark)
+            .unwrap_or(base_px);
+        let stop_triggered = if is_stop {
+            match o.side {
+                OrderSide::Sell => current_mark <= o.stop_price.unwrap_or(0.0),
+                OrderSide::Buy => current_mark >= o.stop_price.unwrap_or(f64::INFINITY),
+            }
+        } else {
+            true
+        };
+
+        if is_stop && !stop_triggered {
+            let bo = BrokerOrder {
+                broker_order_id: Uuid::new_v4().to_string(),
+                client_order_id: o.client_order_id,
+                status: OrderStatus::Accepted,
+                filled_qty: 0,
+                filled_avg_price: None,
+                symbol: Some(o.symbol.clone()),
+                qty: Some(o.qty),
+                side: Some(o.side),
+                limit_price: o.limit_price,
+                order_type: Some(th_domain::OrderType::Stop),
+                stop_price: o.stop_price,
+                time_in_force: Some("day".into()),
+                position_intent: Some("sell_to_close".into()),
+            };
+            s.orders.insert(o.client_order_id, bo.clone());
+            return Ok(bo);
+        }
+
+        // Apply realistic slippage & spread crossing
+        let slip_bps = s.config.slippage_bps;
+        let spread_bps = s.config.spread_bps;
+        let px = match o.side {
+            OrderSide::Buy => base_px * (1.0 + (slip_bps + spread_bps / 2.0) / 10_000.0),
+            OrderSide::Sell => base_px * (1.0 - (slip_bps + spread_bps / 2.0) / 10_000.0),
+        };
 
         // Calculate fill quantity (handling realistic partial fills)
         let fill_qty = if let Some(pct) = s.config.partial_fill_pct {
@@ -224,6 +308,10 @@ impl Broker for PaperBroker {
             qty: Some(o.qty),
             side: Some(o.side),
             limit_price: o.limit_price,
+            order_type: Some(o.resolved_order_type()),
+            stop_price: o.stop_price,
+            time_in_force: Some("day".into()),
+            position_intent: Some("sell_to_close".into()),
         };
         if o.side == OrderSide::Buy {
             let e = s.positions.entry(o.symbol.clone()).or_insert(Position {
@@ -384,24 +472,22 @@ impl AlpacaBroker {
         if key.trim().is_empty() || secret.trim().is_empty() {
             return Err(ExecutionError::UnsafeLive("missing credentials".into()));
         }
-        let norm_url = base_url
-            .trim_end_matches('/')
-            .trim_end_matches("/v2")
-            .to_string();
+        let parsed = reqwest::Url::parse(&base_url)
+            .map_err(|e| ExecutionError::UnsafeLive(format!("invalid Alpaca base_url: {e}")))?;
+        let host = parsed.host_str().unwrap_or("");
+        let scheme = parsed.scheme();
+        let is_localhost = host == "127.0.0.1" || host == "localhost";
 
-        if !norm_url.starts_with("https://")
-            && !norm_url.starts_with("http://127.0.0.1")
-            && !norm_url.starts_with("http://localhost")
-        {
+        if scheme != "https" && !is_localhost {
             return Err(ExecutionError::UnsafeLive(
                 "TLS required: Alpaca base_url must use https://".into(),
             ));
         }
 
         if live {
-            if !norm_url.contains("api.alpaca.markets") || norm_url.contains("paper-api") {
+            if host != "api.alpaca.markets" && !is_localhost {
                 return Err(ExecutionError::UnsafeLive(
-                    "live trading requires production endpoint https://api.alpaca.markets".into(),
+                    format!("live trading requires exact production endpoint https://api.alpaca.markets, got host: {host}"),
                 ));
             }
             if std::env::var("TRADING_HIVE_LIVE_CONFIRM").ok().as_deref() != Some("YES") {
@@ -409,11 +495,24 @@ impl AlpacaBroker {
                     "TRADING_HIVE_LIVE_CONFIRM=YES required for live trading".into(),
                 ));
             }
-        } else if norm_url.contains("api.alpaca.markets") && !norm_url.contains("paper-api") {
-            return Err(ExecutionError::UnsafeLive(
-                "paper trading cannot point to production live endpoint api.alpaca.markets".into(),
-            ));
+        } else {
+            if host == "api.alpaca.markets" {
+                return Err(ExecutionError::UnsafeLive(
+                    "paper trading cannot point to production live endpoint api.alpaca.markets"
+                        .into(),
+                ));
+            }
+            if host != "paper-api.alpaca.markets" && !is_localhost {
+                return Err(ExecutionError::UnsafeLive(
+                    format!("paper trading requires exact paper endpoint https://paper-api.alpaca.markets, got host: {host}"),
+                ));
+            }
         }
+
+        let norm_url = base_url
+            .trim_end_matches('/')
+            .trim_end_matches("/v2")
+            .to_string();
 
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(15))
@@ -447,11 +546,28 @@ struct AlpacaOrderResp {
     side: Option<String>,
     #[serde(default)]
     limit_price: Option<String>,
+    #[serde(default, rename = "type")]
+    order_type: Option<String>,
+    #[serde(default)]
+    stop_price: Option<String>,
+    #[serde(default)]
+    time_in_force: Option<String>,
+    #[serde(default)]
+    position_intent: Option<String>,
 }
 fn parse_side(s: &str) -> Option<OrderSide> {
     match s.to_ascii_lowercase().as_str() {
         "buy" => Some(OrderSide::Buy),
         "sell" => Some(OrderSide::Sell),
+        _ => None,
+    }
+}
+fn parse_order_type(s: &str) -> Option<th_domain::OrderType> {
+    match s.to_ascii_lowercase().as_str() {
+        "market" => Some(th_domain::OrderType::Market),
+        "limit" => Some(th_domain::OrderType::Limit),
+        "stop" => Some(th_domain::OrderType::Stop),
+        "stop_limit" => Some(th_domain::OrderType::StopLimit),
         _ => None,
     }
 }
@@ -469,6 +585,50 @@ fn parse_status(s: &str) -> OrderStatus {
         _ => OrderStatus::Unknown,
     }
 }
+fn alpaca_resp_to_broker_order(x: AlpacaOrderResp) -> Result<BrokerOrder, ExecutionError> {
+    let client =
+        Uuid::parse_str(&x.client_order_id).map_err(|e| ExecutionError::Broker(e.to_string()))?;
+    let status = parse_status(&x.status);
+    let filled_qty: u32 = x
+        .filled_qty
+        .parse()
+        .map_err(|_| ExecutionError::Broker("invalid filled_qty from broker".into()))?;
+    let filled_avg_price = match x.filled_avg_price.as_deref() {
+        Some(s) => match s.parse::<f64>() {
+            Ok(p) if p.is_finite() && p > 0.0 => Some(p),
+            _ if status == OrderStatus::Filled && filled_qty > 0 => {
+                return Err(ExecutionError::Broker(format!(
+                    "broker order {} is Filled but has invalid filled_avg_price: {:?}",
+                    x.id, s
+                )));
+            }
+            _ => None,
+        },
+        None if status == OrderStatus::Filled && filled_qty > 0 => {
+            return Err(ExecutionError::Broker(format!(
+                "broker order {} is Filled but missing filled_avg_price",
+                x.id
+            )));
+        }
+        None => None,
+    };
+    Ok(BrokerOrder {
+        broker_order_id: x.id,
+        client_order_id: client,
+        status,
+        filled_qty,
+        filled_avg_price,
+        symbol: x.symbol,
+        qty: x.qty.and_then(|q| q.parse().ok()),
+        side: x.side.as_deref().and_then(parse_side),
+        limit_price: x.limit_price.and_then(|p| p.parse().ok()),
+        order_type: x.order_type.as_deref().and_then(parse_order_type),
+        stop_price: x.stop_price.and_then(|p| p.parse().ok()),
+        time_in_force: x.time_in_force,
+        position_intent: x.position_intent,
+    })
+}
+
 #[async_trait]
 impl Broker for AlpacaBroker {
     async fn submit(&self, o: &OrderIntent) -> Result<BrokerOrder, ExecutionError> {
@@ -540,22 +700,7 @@ impl Broker for AlpacaBroker {
             .json()
             .await
             .map_err(|e| ExecutionError::Broker(e.to_string()))?;
-        let client = Uuid::parse_str(&x.client_order_id)
-            .map_err(|e| ExecutionError::Broker(e.to_string()))?;
-        Ok(BrokerOrder {
-            broker_order_id: x.id,
-            client_order_id: client,
-            status: parse_status(&x.status),
-            filled_qty: x
-                .filled_qty
-                .parse()
-                .map_err(|_| ExecutionError::Broker("invalid filled_qty from broker".into()))?,
-            filled_avg_price: x.filled_avg_price.and_then(|v| v.parse().ok()),
-            symbol: x.symbol,
-            qty: x.qty.and_then(|q| q.parse().ok()),
-            side: x.side.as_deref().and_then(parse_side),
-            limit_price: x.limit_price.and_then(|p| p.parse().ok()),
-        })
+        alpaca_resp_to_broker_order(x)
     }
     async fn find_by_client_order_id(
         &self,
@@ -588,21 +733,7 @@ impl Broker for AlpacaBroker {
         let Some(x) = xs.into_iter().find(|x| x.client_order_id == id.to_string()) else {
             return Ok(None);
         };
-        Ok(Some(BrokerOrder {
-            broker_order_id: x.id,
-            client_order_id: Uuid::parse_str(&x.client_order_id)
-                .map_err(|e| ExecutionError::Broker(e.to_string()))?,
-            status: parse_status(&x.status),
-            filled_qty: x
-                .filled_qty
-                .parse()
-                .map_err(|_| ExecutionError::Broker("invalid filled_qty from broker".into()))?,
-            filled_avg_price: x.filled_avg_price.and_then(|v| v.parse().ok()),
-            symbol: x.symbol,
-            qty: x.qty.and_then(|q| q.parse().ok()),
-            side: x.side.as_deref().and_then(parse_side),
-            limit_price: x.limit_price.and_then(|p| p.parse().ok()),
-        }))
+        alpaca_resp_to_broker_order(x).map(Some)
     }
     async fn get_order(&self, id: &str) -> Result<BrokerOrder, ExecutionError> {
         let url = format!("{}/v2/orders/{}", self.base_url.trim_end_matches('/'), id);
@@ -622,21 +753,7 @@ impl Broker for AlpacaBroker {
             .json()
             .await
             .map_err(|e| ExecutionError::Broker(e.to_string()))?;
-        Ok(BrokerOrder {
-            broker_order_id: x.id,
-            client_order_id: Uuid::parse_str(&x.client_order_id)
-                .map_err(|e| ExecutionError::Broker(e.to_string()))?,
-            status: parse_status(&x.status),
-            filled_qty: x
-                .filled_qty
-                .parse()
-                .map_err(|_| ExecutionError::Broker("invalid filled_qty from broker".into()))?,
-            filled_avg_price: x.filled_avg_price.and_then(|v| v.parse().ok()),
-            symbol: x.symbol,
-            qty: x.qty.and_then(|q| q.parse().ok()),
-            side: x.side.as_deref().and_then(parse_side),
-            limit_price: x.limit_price.and_then(|p| p.parse().ok()),
-        })
+        alpaca_resp_to_broker_order(x)
     }
     async fn cancel(&self, id: &str) -> Result<(), ExecutionError> {
         let url = format!("{}/v2/orders/{}", self.base_url.trim_end_matches('/'), id);
@@ -683,13 +800,17 @@ impl Broker for AlpacaBroker {
                 .get("qty")
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse().ok())
-                .ok_or_else(|| ExecutionError::Broker(format!("position {sym} missing or invalid qty")))?;
+                .ok_or_else(|| {
+                    ExecutionError::Broker(format!("position {sym} missing or invalid qty"))
+                })?;
             let avg_price: f64 = x
                 .get("avg_entry_price")
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse().ok())
                 .ok_or_else(|| {
-                    ExecutionError::Broker(format!("position {sym} missing or invalid avg_entry_price"))
+                    ExecutionError::Broker(format!(
+                        "position {sym} missing or invalid avg_entry_price"
+                    ))
                 })?;
             let mark: f64 = x
                 .get("current_price")
@@ -697,7 +818,9 @@ impl Broker for AlpacaBroker {
                 .and_then(|s| s.parse::<f64>().ok())
                 .filter(|v| v.is_finite() && *v >= 0.0)
                 .ok_or_else(|| {
-                    ExecutionError::Broker(format!("position {sym} missing or invalid current_price mark"))
+                    ExecutionError::Broker(format!(
+                        "position {sym} missing or invalid current_price mark"
+                    ))
                 })?;
             positions.push(Position {
                 qty,
@@ -765,7 +888,9 @@ impl Broker for AlpacaBroker {
                 .and_then(|s| s.parse::<f64>().ok())
                 .filter(|v| v.is_finite())
                 .ok_or_else(|| {
-                    ExecutionError::Broker(format!("missing or invalid account financial field: {k}"))
+                    ExecutionError::Broker(format!(
+                        "missing or invalid account financial field: {k}"
+                    ))
                 })
         };
         Ok(AccountSnapshot {
@@ -795,25 +920,7 @@ impl Broker for AlpacaBroker {
             .json()
             .await
             .map_err(|e| ExecutionError::Broker(e.to_string()))?;
-        xs.into_iter()
-            .map(|x| {
-                Ok(BrokerOrder {
-                    broker_order_id: x.id,
-                    client_order_id: Uuid::parse_str(&x.client_order_id)
-                        .map_err(|e| ExecutionError::Broker(e.to_string()))?,
-                    status: parse_status(&x.status),
-                    filled_qty: x
-                        .filled_qty
-                        .parse()
-                        .map_err(|_| ExecutionError::Broker("invalid filled_qty".into()))?,
-                    filled_avg_price: x.filled_avg_price.and_then(|v| v.parse().ok()),
-                    symbol: x.symbol,
-                    qty: x.qty.and_then(|q| q.parse().ok()),
-                    side: x.side.as_deref().and_then(parse_side),
-                    limit_price: x.limit_price.and_then(|p| p.parse().ok()),
-                })
-            })
-            .collect()
+        xs.into_iter().map(alpaca_resp_to_broker_order).collect()
     }
     async fn cancel_all_orders(&self) -> Result<Vec<String>, ExecutionError> {
         // Alpaca DELETE /v2/orders returns 207 Multi-Status with per-order results.
@@ -917,6 +1024,18 @@ impl<B: Broker> ExecutionEngine<B> {
         spread_bps: f64,
         portfolio: &PortfolioRisk,
     ) -> Result<(BrokerOrder, RiskApproval), ExecutionError> {
+        self.execute_with_stop(o, price, spread_bps, portfolio, None)
+            .await
+    }
+
+    pub async fn execute_with_stop(
+        &mut self,
+        o: OrderIntent,
+        price: f64,
+        spread_bps: f64,
+        portfolio: &PortfolioRisk,
+        proposed_stop_loss_pct: Option<f64>,
+    ) -> Result<(BrokerOrder, RiskApproval), ExecutionError> {
         let broker_clock = self.broker.clock().await?;
         if !broker_clock.is_open && !o.reduce_only {
             return Err(ExecutionError::MarketClosed("MARKET_CLOSED".into()));
@@ -945,7 +1064,7 @@ impl<B: Broker> ExecutionEngine<B> {
         }
         let a = self
             .risk
-            .authorize(&o, price, spread_bps, portfolio)
+            .authorize_with_stop(&o, price, spread_bps, portfolio, proposed_stop_loss_pct)
             .map_err(|e| ExecutionError::Risk(e.to_string()))?;
         self.risk
             .validate_token(&a, o.client_order_id, &o.order_hash)
@@ -1127,7 +1246,10 @@ mod tests {
             order_type: Some(th_domain::OrderType::Market),
             stop_price: None,
         };
-        let exit_res = broker.submit(&exit_intent).await.expect("market exit must succeed");
+        let exit_res = broker
+            .submit(&exit_intent)
+            .await
+            .expect("market exit must succeed");
         assert_eq!(exit_res.client_order_id, exit_intent.client_order_id);
         let flat_positions = broker.positions().await.expect("positions must succeed");
         assert!(flat_positions.is_empty() || flat_positions.iter().all(|p| p.qty == 0));

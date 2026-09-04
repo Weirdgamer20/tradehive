@@ -42,7 +42,10 @@ impl Default for StateKey {
 
 impl StateKey {
     pub fn from_state(s: &MarketState) -> Self {
-        let session_open = th_domain::MarketSessionClock::default().is_open(s.as_of);
+        Self::from_state_with_open(s, th_domain::MarketSessionClock::default().is_open(s.as_of))
+    }
+
+    pub fn from_state_with_open(s: &MarketState, session_open: bool) -> Self {
         Self {
             regime: format!("{:?}", s.regime),
             vol_bucket: (s.volatility * 100.0).round().clamp(0.0, 255.0) as u8,
@@ -131,20 +134,25 @@ impl QLearning {
             .cloned()
     }
     /// Pure greedy action selection for live trading — zero random exploration with live capital.
+    /// Returns None if the state is unobserved/untrained (no non-zero Q-value recorded)
+    /// to avoid arbitrary suppression of other candidate strategies.
     pub fn choose_greedy(&self, state: &StateKey, actions: &[String]) -> Option<String> {
         if actions.is_empty() {
             return None;
         }
-        actions
-            .iter()
-            .max_by(|a, b| {
-                self.q
-                    .get(&(state.clone(), (*a).clone()))
-                    .unwrap_or(&0.0)
-                    .partial_cmp(self.q.get(&(state.clone(), (*b).clone())).unwrap_or(&0.0))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .cloned()
+        let mut best: Option<(&String, f64)> = None;
+        for a in actions {
+            if let Some(&val) = self.q.get(&(state.clone(), a.clone())) {
+                if val.abs() > 1e-9 {
+                    match best {
+                        None => best = Some((a, val)),
+                        Some((_, best_val)) if val > best_val => best = Some((a, val)),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        best.map(|(a, _)| a.clone())
     }
     pub fn unique_actions(&self) -> Vec<String> {
         let mut set = std::collections::BTreeSet::new();
@@ -154,12 +162,20 @@ impl QLearning {
         set.into_iter().collect()
     }
     pub fn update(&mut self, e: &Experience) {
+        self.update_with_legal_actions(e, &[])
+    }
+    pub fn update_with_legal_actions(&mut self, e: &Experience, legal_next: &[String]) {
         let old = *self
             .q
             .get(&(e.state.clone(), e.action.clone()))
             .unwrap_or(&0.0);
         let next = if e.terminal {
             0.0
+        } else if !legal_next.is_empty() {
+            legal_next
+                .iter()
+                .filter_map(|a| self.q.get(&(e.next_state.clone(), a.clone())).copied())
+                .fold(0.0, f64::max)
         } else {
             self.q
                 .iter()
@@ -735,35 +751,48 @@ pub fn learn_from_trades(
         let Some(spread) = t.quote_spread_bps else {
             continue;
         };
-        if !entry_fill.is_finite() || entry_fill <= 0.0 || !slippage.is_finite() || !spread.is_finite() {
+        if !entry_fill.is_finite()
+            || entry_fill <= 0.0
+            || !slippage.is_finite()
+            || !spread.is_finite()
+        {
             continue;
         }
         let duration_mins = (exit_ts - t.entry).num_minutes().max(0) as usize;
         let bars_held = (duration_mins / 5).max(1);
         let capital = entry_fill * 100.0;
-        let fees = if t.fees.is_finite() && t.fees >= 0.0 { t.fees } else { 0.0 };
+        let fees = if t.fees.is_finite() && t.fees >= 0.0 {
+            t.fees
+        } else {
+            0.0
+        };
 
         let exit_idx = bars.iter().rposition(|b| b.ts <= exit_ts).unwrap_or(0);
         let next_state = StateKey::from_state(&classify_regime(&bars[..=exit_idx]));
 
-        let reward = compute_economic_rl_reward(
-            t.pnl,
-            capital,
-            slippage,
-            spread,
-            fees,
-            bars_held,
-        )
-        .composite_reward;
+        let reward = compute_economic_rl_reward(t.pnl, capital, slippage, spread, fees, bars_held)
+            .composite_reward;
         q.update(&Experience {
-            state,
+            state: state.clone(),
             action: t.strategy_id.clone(),
             reward,
-            next_state,
+            next_state: next_state.clone(),
             terminal: true,
             decision_ts: t.entry,
             outcome_ts: exit_ts,
         });
+        if let Some(ref ep) = t.exit_policy {
+            let factorized_action = format!("{}:{}", t.strategy_id, ep);
+            q.update(&Experience {
+                state,
+                action: factorized_action,
+                reward,
+                next_state,
+                terminal: true,
+                decision_ts: t.entry,
+                outcome_ts: exit_ts,
+            });
+        }
         updates += 1;
     }
     (q, updates)
@@ -873,20 +902,25 @@ pub fn run_analysis_with_q(bars: &[Bar], prior: Option<QLearning>) -> AnalysisRe
             })
             .collect::<Vec<_>>();
         let clock = th_domain::MarketSessionClock::default();
-        for i in 0..bars.len() - 1 {
+        let train_bars = if let Ok(sp) = split(bars, 0.6, 0.2) {
+            sp.train
+        } else {
+            bars.to_vec()
+        };
+        for i in 0..train_bars.len().saturating_sub(1) {
             // Only generate active trading experiences during official regular market hours
-            if !clock.is_open(bars[i].ts) {
+            if !clock.is_open(train_bars[i].ts) {
                 continue;
             }
-            let state = StateKey::from_state(&classify_regime(&bars[..=i]));
-            let next = StateKey::from_state(&classify_regime(&bars[..=i + 1]));
-            let market_state = classify_regime(&bars[..=i]);
+            let state = StateKey::from_state(&classify_regime(&train_bars[..=i]));
+            let next = StateKey::from_state(&classify_regime(&train_bars[..=i + 1]));
+            let market_state = classify_regime(&train_bars[..=i]);
             for (idx, processor) in processors.iter_mut().enumerate() {
-                if let Some(sig) = processor.update(&bars[i], &market_state) {
+                if let Some(sig) = processor.update(&train_bars[i], &market_state) {
                     if sig.side == SignalSide::Flat {
                         continue;
                     }
-                    let r = bars[i + 1].close / bars[i].close - 1.0;
+                    let r = train_bars[i + 1].close / train_bars[i].close - 1.0;
                     // Research training signal: uses directional underlying bar return as proxy.
                     // (Live RL reward uses actual realized option fill P&L in BotRuntime).
                     let directional_return = match sig.side {
@@ -900,9 +934,9 @@ pub fn run_analysis_with_q(bars: &[Bar], prior: Option<QLearning>) -> AnalysisRe
                         action: actions[idx].clone(),
                         reward,
                         next_state: next.clone(),
-                        terminal: i + 1 == bars.len() - 1,
-                        decision_ts: bars[i].ts,
-                        outcome_ts: bars[i + 1].ts,
+                        terminal: i + 1 == train_bars.len() - 1,
+                        decision_ts: train_bars[i].ts,
+                        outcome_ts: train_bars[i + 1].ts,
                     };
                     rl.update(&exp);
                     experiences.push(exp);
@@ -1709,7 +1743,7 @@ pub fn manufacture_promoted_bots_for_session(
             Regime::TrendingBear => th_domain::OptionType::Put,
             _ => th_domain::OptionType::Call,
         };
-        let expiry_policy = th_domain::OptionExpiryPolicy::new(
+        let _expiry_policy = th_domain::OptionExpiryPolicy::new(
             policy.min_expiry_minutes,
             if policy.max_expiry_minutes == u32::MAX {
                 None
@@ -1717,13 +1751,12 @@ pub fn manufacture_promoted_bots_for_session(
                 Some(policy.max_expiry_minutes)
             },
         );
-        let ranking_pipeline = th_options_data::OptionRankingPipeline::new(
-            th_options_data::OptionRankingConfig {
+        let ranking_pipeline =
+            th_options_data::OptionRankingPipeline::new(th_options_data::OptionRankingConfig {
                 min_dte_minutes: policy.min_expiry_minutes as i64,
                 max_quote_age_secs: 300,
                 ..Default::default()
-            },
-        );
+            });
         let od_chain = th_options_data::OptionChain::from(chain);
         let ranked_contract = ranking_pipeline
             .rank_and_select(
@@ -1735,54 +1768,15 @@ pub fn manufacture_promoted_bots_for_session(
             )
             .ok();
 
-        let Some(quote) = ranked_contract
-            .and_then(|assigned| {
-                chain
-                    .quotes
-                    .iter()
-                    .find(|q| q.symbol == assigned.contract_symbol)
-                    .cloned()
-            })
-            .or_else(|| {
-                chain
-                    .quotes
-                    .iter()
-                    .filter(|q| {
-                        q.underlying == *symbol
-                            && q.option_type == wanted
-                            && q.bid > 0.0
-                            && q.ask >= q.bid
-                            && q.dte(now) > 0.0
-                            && expiry_policy.is_valid_expiry(now, q.expiry)
-                    })
-                    .min_by(|a, b| {
-                        a.spread_bps()
-                            .partial_cmp(&b.spread_bps())
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    })
-                    .cloned()
-            })
-            .or_else(|| {
-                chain
-                    .quotes
-                    .iter()
-                    .filter(|q| {
-                        q.underlying == *symbol
-                            && q.option_type == wanted
-                            && q.bid > 0.0
-                            && q.ask >= q.bid
-                            && q.dte(now) > 0.0
-                    })
-                    .min_by(|a, b| {
-                        a.spread_bps()
-                            .partial_cmp(&b.spread_bps())
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    })
-                    .cloned()
-            })
-        else {
+        let Some(quote) = ranked_contract.and_then(|assigned| {
+            chain
+                .quotes
+                .iter()
+                .find(|q| q.symbol == assigned.contract_symbol)
+                .cloned()
+        }) else {
             println!(
-                "BOT_MANUFACTURE_SKIPPED symbol={symbol} strategy={strategy_id} reason=NO_MATCHING_OPTION_CONTRACT"
+                "BOT_MANUFACTURE_SKIPPED symbol={symbol} strategy={strategy_id} reason=NO_ELIGIBLE_CONTRACT_RANKED"
             );
             continue;
         };
