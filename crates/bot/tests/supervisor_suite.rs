@@ -835,6 +835,7 @@ async fn test_supervisor_finalization_failure_transitions_to_recovering() {
             stop_loss_pct: 0.05,
             take_profit_pct: 0.10,
             qty: 1,
+            protective_order_id: None,
         },
     );
 
@@ -971,6 +972,7 @@ async fn test_recovery_false_reconciliation_stays_in_recovering() {
             stop_loss_pct: 0.05,
             take_profit_pct: 0.10,
             qty: 1,
+            protective_order_id: None,
         },
     );
 
@@ -1059,6 +1061,7 @@ async fn test_retry_budget_exhausted_enters_halted() {
             stop_loss_pct: 0.05,
             take_profit_pct: 0.10,
             qty: 1,
+            protective_order_id: None,
         },
     );
 
@@ -1137,6 +1140,7 @@ async fn test_preparing_session_reconcile_failure_does_not_clear_state() {
             stop_loss_pct: 0.05,
             take_profit_pct: 0.10,
             qty: 1,
+            protective_order_id: None,
         },
     );
 

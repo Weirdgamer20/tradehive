@@ -184,6 +184,7 @@ async fn test_complete_e2e_paper_lifecycle() {
             stop_loss_pct: 0.05,
             take_profit_pct: 0.10,
             qty: 2,
+            protective_order_id: None,
         },
     );
 

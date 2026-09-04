@@ -277,6 +277,14 @@ pub struct OpenTrade {
     pub stop_loss_pct: f64,
     pub take_profit_pct: f64,
     pub qty: u32,
+    /// Broker order ID of the protective sell-to-close limit order submitted
+    /// immediately after the entry fill. `None` means the protective order
+    /// has not yet been submitted or submission failed (the process-level
+    /// `manage_open_trade` exit loop remains the fallback safety net).
+    /// NOTE: Alpaca does not support OTO/bracket/stop orders for options,
+    /// so this is a separate limit order submitted post-fill.
+    #[serde(default)]
+    pub protective_order_id: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionStats {
@@ -432,6 +440,7 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                         stop_loss_pct: row.stop_loss_pct,
                         take_profit_pct: row.take_profit_pct,
                         qty: row.qty,
+                        protective_order_id: row.protective_order_id,
                     },
                 );
             }
@@ -685,7 +694,97 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
             let mark = q.bid;
             let ret = mark / t.entry_price - 1.0;
             let age = (Utc::now() - t.entry_ts).num_minutes();
-            if ret <= -t.stop_loss_pct
+
+            // Check liveness of the broker-side protective order.
+            // If it is still working at the broker, the stop-loss leg is
+            // protected broker-side; skip the local stop-loss check for
+            // this trade (take-profit and time-limit checks still run).
+            // If it is missing/cancelled/rejected, re-submit it.
+            let protective_order_working = if let Some(ref pid) = t.protective_order_id {
+                match self.execution.broker_ref().get_order(pid).await {
+                    Ok(pbo) => {
+                        if matches!(
+                            pbo.status,
+                            th_domain::OrderStatus::New
+                                | th_domain::OrderStatus::Accepted
+                                | th_domain::OrderStatus::PartiallyFilled
+                        ) {
+                            true // Still working — broker will execute the stop
+                        } else {
+                            // Terminal or unknown state — need to re-submit
+                            println!(
+                                "PROTECTIVE_ORDER_TERMINAL symbol={} broker_order_id={} status={:?} will_resubmit=true",
+                                t.symbol, pid, pbo.status
+                            );
+                            false
+                        }
+                    }
+                    Err(e) => {
+                        println!(
+                            "PROTECTIVE_ORDER_CHECK_FAILED symbol={} broker_order_id={} error={}",
+                            t.symbol, pid, e
+                        );
+                        // Treat as not working; fall through to process-level check.
+                        false
+                    }
+                }
+            } else {
+                false
+            };
+
+            // If the protective order is no longer working, try to re-submit it.
+            if !protective_order_working && t.protective_order_id.is_some() {
+                let sl_price = (t.entry_price * (1.0 - t.stop_loss_pct)).max(0.01);
+                let reprotect = OrderIntent {
+                    client_order_id: Uuid::new_v4(),
+                    symbol: t.symbol.clone(),
+                    side: OrderSide::Sell,
+                    qty: t.qty,
+                    limit_price: Some(sl_price),
+                    reduce_only: true,
+                    strategy_id: t.strategy_id.clone(),
+                    created_at: Utc::now(),
+                    order_hash: String::new(),
+                    bot_id: Some(t.strategy_id.clone()),
+                    session_id: self.current_session_id.clone(),
+                    decision_id: None,
+                    oms_state: Some(th_domain::OmsState::IntentCreated),
+                    option_action: Some(OptionOrderAction::SellToClose),
+                };
+                match self.execution.broker_ref().submit(&reprotect).await {
+                    Ok(pbo) => {
+                        println!(
+                            "PROTECTIVE_ORDER_RESUBMITTED symbol={} broker_order_id={} sl_price={:.2}",
+                            t.symbol, pbo.broker_order_id, sl_price
+                        );
+                        if let Some(trade) = self.open_trades.get_mut(&key) {
+                            trade.protective_order_id = Some(pbo.broker_order_id.clone());
+                            let _ = self.store.open_trade(&OpenTradeRecord {
+                                symbol: trade.symbol.clone(),
+                                underlying: trade.underlying.clone(),
+                                strategy_id: trade.strategy_id.clone(),
+                                entry_price: trade.entry_price,
+                                entry_ts: trade.entry_ts.to_rfc3339(),
+                                stop_loss_pct: trade.stop_loss_pct,
+                                take_profit_pct: trade.take_profit_pct,
+                                qty: trade.qty,
+                                protective_order_id: trade.protective_order_id.clone(),
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        println!(
+                            "PROTECTIVE_ORDER_RESUBMIT_FAILED symbol={} sl_price={:.2} error={}",
+                            t.symbol, sl_price, e
+                        );
+                    }
+                }
+            }
+
+            // Process-level exit: handles take-profit and time-limit unconditionally.
+            // Also handles stop-loss when the protective order is not working.
+            let stop_loss_triggered = !protective_order_working && ret <= -t.stop_loss_pct;
+            if stop_loss_triggered
                 || (t.take_profit_pct > 0.0 && ret >= t.take_profit_pct)
                 || age >= self.cfg.bot_max_hold_minutes as i64
             {
@@ -940,6 +1039,7 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                                 stop_loss_pct: remaining.stop_loss_pct,
                                 take_profit_pct: remaining.take_profit_pct,
                                 qty: remaining.qty,
+                                protective_order_id: remaining.protective_order_id.clone(),
                             })
                             .map_err(|e| RuntimeError::Storage(e.to_string()))?;
                     }
@@ -1342,6 +1442,50 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                     "FILL_RECEIVED fill_id={} broker_order_id={} symbol={} qty={} price={:.2}",
                     fill.fill_id, bo.broker_order_id, order.symbol, bo.filled_qty, fp
                 );
+                // Compute the stop-loss limit price from the actual fill price
+                // (not the ask — the fill price is the authoritative cost basis).
+                // NOTE: Alpaca does not support OTO/bracket/stop orders for options;
+                // we must submit a separate sell-to-close limit order post-fill.
+                let sl_price = (fp * (1.0 - self.cfg.stop_loss_pct)).max(0.01);
+                let protective_intent = OrderIntent {
+                    client_order_id: Uuid::new_v4(),
+                    symbol: order.symbol.clone(),
+                    side: OrderSide::Sell,
+                    qty: bo.filled_qty,
+                    limit_price: Some(sl_price),
+                    reduce_only: true,
+                    strategy_id: order.strategy_id.clone(),
+                    created_at: Utc::now(),
+                    order_hash: String::new(),
+                    bot_id: order.bot_id.clone(),
+                    session_id: order.session_id.clone(),
+                    decision_id: None,
+                    oms_state: Some(th_domain::OmsState::IntentCreated),
+                    option_action: Some(OptionOrderAction::SellToClose),
+                };
+                let protective_broker_id = match self
+                    .execution
+                    .broker_ref()
+                    .submit(&protective_intent)
+                    .await
+                {
+                    Ok(pbo) => {
+                        println!(
+                            "PROTECTIVE_ORDER_SUBMITTED symbol={} broker_order_id={} limit_price={:.2} qty={}",
+                            order.symbol, pbo.broker_order_id, sl_price, bo.filled_qty
+                        );
+                        Some(pbo.broker_order_id)
+                    }
+                    Err(e) => {
+                        // Soft failure: the process-level manage_open_trade exit loop
+                        // remains the safety net. The position is not abandoned.
+                        println!(
+                            "PROTECTIVE_ORDER_FAILED symbol={} sl_price={:.2} error={}",
+                            order.symbol, sl_price, e
+                        );
+                        None
+                    }
+                };
                 let opened = OpenTrade {
                     symbol: order.symbol.clone(),
                     underlying: sig.symbol.clone(),
@@ -1351,6 +1495,7 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                     stop_loss_pct: self.cfg.stop_loss_pct,
                     take_profit_pct: self.cfg.take_profit_pct,
                     qty: bo.filled_qty,
+                    protective_order_id: protective_broker_id,
                 };
                 self.store
                     .open_trade(&OpenTradeRecord {
@@ -1362,14 +1507,16 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                         stop_loss_pct: opened.stop_loss_pct,
                         take_profit_pct: opened.take_profit_pct,
                         qty: opened.qty,
+                        protective_order_id: opened.protective_order_id.clone(),
                     })
                     .map_err(|e| RuntimeError::Storage(e.to_string()))?;
                 self.open_trades
                     .insert(order.symbol.clone(), opened.clone());
                 self.stats.trades_opened += 1;
                 println!(
-                    "POSITION_OPENED symbol={} underlying={} strategy_id={} qty={} entry_price={:.2}",
-                    opened.symbol, opened.underlying, opened.strategy_id, opened.qty, opened.entry_price
+                    "POSITION_OPENED symbol={} underlying={} strategy_id={} qty={} entry_price={:.2} protective_order={}",
+                    opened.symbol, opened.underlying, opened.strategy_id, opened.qty, opened.entry_price,
+                    opened.protective_order_id.as_deref().unwrap_or("none")
                 );
                 let _ = self.store.record_feedback(&ExecutionFeedbackRecord {
                     event_id: None,
@@ -2348,6 +2495,7 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                         stop_loss_pct: remaining.stop_loss_pct,
                         take_profit_pct: remaining.take_profit_pct,
                         qty: remaining.qty,
+                        protective_order_id: remaining.protective_order_id.clone(),
                     });
                     println!(
                         "POSITION_PARTIALLY_CLOSED symbol={} underlying={} filled_qty={} remaining_qty={} pnl={:.2}",

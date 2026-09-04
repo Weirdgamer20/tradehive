@@ -16,6 +16,12 @@ pub struct OpenTradeRecord {
     pub stop_loss_pct: f64,
     pub take_profit_pct: f64,
     pub qty: u32,
+    /// Broker order ID of the protective sell-to-close limit order submitted
+    /// immediately after the entry fill. `None` if the protective order has
+    /// not yet been submitted (e.g., first tick after fill) or submission
+    /// failed (process-level exit remains the safety net in that case).
+    #[serde(default)]
+    pub protective_order_id: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -73,31 +79,50 @@ impl Store {
  CREATE INDEX IF NOT EXISTS idx_execution_feedback_bot ON execution_feedback(bot_id);
  CREATE INDEX IF NOT EXISTS idx_execution_feedback_kind ON execution_feedback(event_kind);
  "#)?;
-        for (name, ddl) in [
+        // Additive migrations: each entry is (column_name, table, ddl).
+        // The column_name is checked via pragma_table_info; if absent the DDL
+        // is executed. All migrations here must be backward-compatible
+        // (ADD COLUMN with DEFAULT / nullable).
+        for (table, name, ddl) in [
             (
+                "bot_plans",
                 "risk_budget",
                 "ALTER TABLE bot_plans ADD COLUMN risk_budget REAL NOT NULL DEFAULT 0",
             ),
             (
+                "bot_plans",
                 "min_expiry_minutes",
                 "ALTER TABLE bot_plans ADD COLUMN min_expiry_minutes INTEGER NOT NULL DEFAULT 120",
             ),
             (
+                "bot_plans",
                 "max_expiry_minutes",
                 "ALTER TABLE bot_plans ADD COLUMN max_expiry_minutes INTEGER NOT NULL DEFAULT 180",
             ),
             (
+                "bot_plans",
                 "allowed_direction",
                 "ALTER TABLE bot_plans ADD COLUMN allowed_direction TEXT NOT NULL DEFAULT 'Any'",
             ),
             (
+                "bot_plans",
                 "session_id",
                 "ALTER TABLE bot_plans ADD COLUMN session_id TEXT NOT NULL DEFAULT ''",
+            ),
+            // Protective broker-side stop-loss order ID (nullable; NULL means
+            // the protective order has not yet been submitted for this trade).
+            (
+                "open_trades",
+                "protective_order_id",
+                "ALTER TABLE open_trades ADD COLUMN protective_order_id TEXT",
             ),
         ] {
             let exists = self
                 .conn
-                .prepare("SELECT 1 FROM pragma_table_info('bot_plans') WHERE name=?")
+                .prepare(&format!(
+                    "SELECT 1 FROM pragma_table_info('{}') WHERE name=?",
+                    table
+                ))
                 .and_then(|mut st| st.query_row([name], |r| r.get::<_, i64>(0)))
                 .is_ok();
             if !exists {
@@ -145,7 +170,7 @@ impl Store {
     }
     pub fn open_trade(&self, trade: &OpenTradeRecord) -> Result<(), StorageError> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO open_trades(symbol,underlying,strategy_id,entry_price,entry_ts,stop_loss_pct,take_profit_pct,qty) VALUES(?,?,?,?,?,?,?,?)",
+            "INSERT OR REPLACE INTO open_trades(symbol,underlying,strategy_id,entry_price,entry_ts,stop_loss_pct,take_profit_pct,qty,protective_order_id) VALUES(?,?,?,?,?,?,?,?,?)",
             params![
                 trade.symbol,
                 trade.underlying,
@@ -154,7 +179,8 @@ impl Store {
                 trade.entry_ts,
                 trade.stop_loss_pct,
                 trade.take_profit_pct,
-                trade.qty
+                trade.qty,
+                trade.protective_order_id
             ],
         )?;
         Ok(())
@@ -166,7 +192,7 @@ impl Store {
     }
     pub fn load_open_trades(&self) -> Result<Vec<OpenTradeRecord>, StorageError> {
         let mut st = self.conn.prepare(
-            "SELECT symbol,underlying,strategy_id,entry_price,entry_ts,stop_loss_pct,take_profit_pct,qty FROM open_trades",
+            "SELECT symbol,underlying,strategy_id,entry_price,entry_ts,stop_loss_pct,take_profit_pct,qty,protective_order_id FROM open_trades",
         )?;
         let rows = st.query_map([], |r| {
             Ok(OpenTradeRecord {
@@ -178,6 +204,7 @@ impl Store {
                 stop_loss_pct: r.get(5)?,
                 take_profit_pct: r.get(6)?,
                 qty: r.get(7)?,
+                protective_order_id: r.get(8)?,
             })
         })?;
         let mut out = Vec::new();
