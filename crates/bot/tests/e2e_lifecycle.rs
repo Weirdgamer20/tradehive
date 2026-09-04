@@ -185,6 +185,8 @@ async fn test_complete_e2e_paper_lifecycle() {
             take_profit_pct: 0.10,
             qty: 2,
             protective_order_id: None,
+            client_order_id: None,
+            entry_state: None,
         },
     );
 

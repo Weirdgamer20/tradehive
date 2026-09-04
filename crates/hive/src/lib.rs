@@ -130,6 +130,22 @@ impl QLearning {
             })
             .cloned()
     }
+    /// Pure greedy action selection for live trading — zero random exploration with live capital.
+    pub fn choose_greedy(&self, state: &StateKey, actions: &[String]) -> Option<String> {
+        if actions.is_empty() {
+            return None;
+        }
+        actions
+            .iter()
+            .max_by(|a, b| {
+                self.q
+                    .get(&(state.clone(), (*a).clone()))
+                    .unwrap_or(&0.0)
+                    .partial_cmp(self.q.get(&(state.clone(), (*b).clone())).unwrap_or(&0.0))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .cloned()
+    }
     pub fn unique_actions(&self) -> Vec<String> {
         let mut set = std::collections::BTreeSet::new();
         for ((_, action), _) in &self.q {
@@ -371,13 +387,15 @@ impl Default for ResearchGate {
 impl ResearchGate {
     pub fn for_bars(bars: &[Bar]) -> Self {
         if bars.len() < 300 {
+            // Research integrity: under 300 bars is insufficient for out-of-sample statistical validity.
+            // Reject promotion instead of lowering bars.
             Self {
-                min_oos_trades: 1,
-                min_sharpe: 0.0,
-                min_profit_factor: 1.0,
-                max_drawdown: 1000.0,
-                max_fdr_q: 1.0,
-                min_robustness: 0.0,
+                min_oos_trades: usize::MAX,
+                min_sharpe: f64::INFINITY,
+                min_profit_factor: f64::INFINITY,
+                max_drawdown: 0.0,
+                max_fdr_q: 0.0,
+                min_robustness: 1.0,
             }
         } else {
             Self::default()
@@ -1676,21 +1694,50 @@ pub fn manufacture_promoted_bots_for_session(
                 Some(policy.max_expiry_minutes)
             },
         );
-        let Some(quote) = chain
-            .quotes
-            .iter()
-            .filter(|q| {
-                q.underlying == *symbol
-                    && q.option_type == wanted
-                    && q.bid > 0.0
-                    && q.ask >= q.bid
-                    && q.dte(now) > 0.0
-                    && expiry_policy.is_valid_expiry(now, q.expiry)
+        let ranking_pipeline = th_options_data::OptionRankingPipeline::new(
+            th_options_data::OptionRankingConfig {
+                min_dte_minutes: policy.min_expiry_minutes as i64,
+                max_quote_age_secs: 300,
+                ..Default::default()
+            },
+        );
+        let od_chain = th_options_data::OptionChain::from(chain);
+        let ranked_contract = ranking_pipeline
+            .rank_and_select(
+                &od_chain,
+                wanted,
+                now,
+                session_id.unwrap_or(""),
+                &format!("BOT-{symbol}-{strategy_id}"),
+            )
+            .ok();
+
+        let Some(quote) = ranked_contract
+            .and_then(|assigned| {
+                chain
+                    .quotes
+                    .iter()
+                    .find(|q| q.symbol == assigned.contract_symbol)
+                    .cloned()
             })
-            .min_by(|a, b| {
-                a.spread_bps()
-                    .partial_cmp(&b.spread_bps())
-                    .unwrap_or(std::cmp::Ordering::Equal)
+            .or_else(|| {
+                chain
+                    .quotes
+                    .iter()
+                    .filter(|q| {
+                        q.underlying == *symbol
+                            && q.option_type == wanted
+                            && q.bid > 0.0
+                            && q.ask >= q.bid
+                            && q.dte(now) > 0.0
+                            && expiry_policy.is_valid_expiry(now, q.expiry)
+                    })
+                    .min_by(|a, b| {
+                        a.spread_bps()
+                            .partial_cmp(&b.spread_bps())
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .cloned()
             })
             .or_else(|| {
                 chain
@@ -1708,8 +1755,8 @@ pub fn manufacture_promoted_bots_for_session(
                             .partial_cmp(&b.spread_bps())
                             .unwrap_or(std::cmp::Ordering::Equal)
                     })
+                    .cloned()
             })
-            .cloned()
         else {
             println!(
                 "BOT_MANUFACTURE_SKIPPED symbol={symbol} strategy={strategy_id} reason=NO_MATCHING_OPTION_CONTRACT"

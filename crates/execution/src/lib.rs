@@ -53,6 +53,14 @@ pub struct BrokerOrder {
     pub status: OrderStatus,
     pub filled_qty: u32,
     pub filled_avg_price: Option<f64>,
+    #[serde(default)]
+    pub symbol: Option<String>,
+    #[serde(default)]
+    pub qty: Option<u32>,
+    #[serde(default)]
+    pub side: Option<OrderSide>,
+    #[serde(default)]
+    pub limit_price: Option<f64>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountSnapshot {
@@ -202,6 +210,10 @@ impl Broker for PaperBroker {
             status,
             filled_qty: fill_qty,
             filled_avg_price: Some(px),
+            symbol: Some(o.symbol.clone()),
+            qty: Some(o.qty),
+            side: Some(o.side),
+            limit_price: o.limit_price,
         };
         if o.side == OrderSide::Buy {
             let e = s.positions.entry(o.symbol.clone()).or_insert(Position {
@@ -362,22 +374,44 @@ impl AlpacaBroker {
         if key.trim().is_empty() || secret.trim().is_empty() {
             return Err(ExecutionError::UnsafeLive("missing credentials".into()));
         }
-        if live && std::env::var("TRADING_HIVE_LIVE_CONFIRM").ok().as_deref() != Some("YES") {
+        let norm_url = base_url
+            .trim_end_matches('/')
+            .trim_end_matches("/v2")
+            .to_string();
+
+        if !norm_url.starts_with("https://")
+            && !norm_url.starts_with("http://127.0.0.1")
+            && !norm_url.starts_with("http://localhost")
+        {
             return Err(ExecutionError::UnsafeLive(
-                "TRADING_HIVE_LIVE_CONFIRM=YES required".into(),
+                "TLS required: Alpaca base_url must use https://".into(),
             ));
         }
+
+        if live {
+            if !norm_url.contains("api.alpaca.markets") || norm_url.contains("paper-api") {
+                return Err(ExecutionError::UnsafeLive(
+                    "live trading requires production endpoint https://api.alpaca.markets".into(),
+                ));
+            }
+            if std::env::var("TRADING_HIVE_LIVE_CONFIRM").ok().as_deref() != Some("YES") {
+                return Err(ExecutionError::UnsafeLive(
+                    "TRADING_HIVE_LIVE_CONFIRM=YES required for live trading".into(),
+                ));
+            }
+        } else if norm_url.contains("api.alpaca.markets") && !norm_url.contains("paper-api") {
+            return Err(ExecutionError::UnsafeLive(
+                "paper trading cannot point to production live endpoint api.alpaca.markets".into(),
+            ));
+        }
+
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(15))
             .build()
             .map_err(|e| ExecutionError::Broker(e.to_string()))?;
-        let base_url = base_url
-            .trim_end_matches('/')
-            .trim_end_matches("/v2")
-            .to_string();
         Ok(Self {
             client,
-            base_url,
+            base_url: norm_url,
             key,
             secret,
             live,
@@ -395,6 +429,21 @@ struct AlpacaOrderResp {
     status: String,
     filled_qty: String,
     filled_avg_price: Option<String>,
+    #[serde(default)]
+    symbol: Option<String>,
+    #[serde(default)]
+    qty: Option<String>,
+    #[serde(default)]
+    side: Option<String>,
+    #[serde(default)]
+    limit_price: Option<String>,
+}
+fn parse_side(s: &str) -> Option<OrderSide> {
+    match s.to_ascii_lowercase().as_str() {
+        "buy" => Some(OrderSide::Buy),
+        "sell" => Some(OrderSide::Sell),
+        _ => None,
+    }
 }
 fn parse_status(s: &str) -> OrderStatus {
     match s {
@@ -479,6 +528,10 @@ impl Broker for AlpacaBroker {
                 .parse()
                 .map_err(|_| ExecutionError::Broker("invalid filled_qty from broker".into()))?,
             filled_avg_price: x.filled_avg_price.and_then(|v| v.parse().ok()),
+            symbol: x.symbol,
+            qty: x.qty.and_then(|q| q.parse().ok()),
+            side: x.side.as_deref().and_then(parse_side),
+            limit_price: x.limit_price.and_then(|p| p.parse().ok()),
         })
     }
     async fn find_by_client_order_id(
@@ -522,6 +575,10 @@ impl Broker for AlpacaBroker {
                 .parse()
                 .map_err(|_| ExecutionError::Broker("invalid filled_qty from broker".into()))?,
             filled_avg_price: x.filled_avg_price.and_then(|v| v.parse().ok()),
+            symbol: x.symbol,
+            qty: x.qty.and_then(|q| q.parse().ok()),
+            side: x.side.as_deref().and_then(parse_side),
+            limit_price: x.limit_price.and_then(|p| p.parse().ok()),
         }))
     }
     async fn get_order(&self, id: &str) -> Result<BrokerOrder, ExecutionError> {
@@ -552,6 +609,10 @@ impl Broker for AlpacaBroker {
                 .parse()
                 .map_err(|_| ExecutionError::Broker("invalid filled_qty from broker".into()))?,
             filled_avg_price: x.filled_avg_price.and_then(|v| v.parse().ok()),
+            symbol: x.symbol,
+            qty: x.qty.and_then(|q| q.parse().ok()),
+            side: x.side.as_deref().and_then(parse_side),
+            limit_price: x.limit_price.and_then(|p| p.parse().ok()),
         })
     }
     async fn cancel(&self, id: &str) -> Result<(), ExecutionError> {
@@ -588,24 +649,43 @@ impl Broker for AlpacaBroker {
             .json()
             .await
             .map_err(|e| ExecutionError::Broker(e.to_string()))?;
-        Ok(xs
-            .into_iter()
-            .filter_map(|x| {
-                let sym = x.get("symbol")?.as_str()?.to_string();
-                Some(Position {
-                    qty: x.get("qty")?.as_str()?.parse().ok()?,
-                    avg_price: x.get("avg_entry_price")?.as_str()?.parse().ok()?,
-                    mark: x
-                        .get("current_price")
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(0.0),
-                    opened_at: Utc::now(),
-                    contract: th_domain::OptionContract::from_occ(&sym),
-                    symbol: sym,
-                })
-            })
-            .collect())
+        let mut positions = Vec::new();
+        for x in xs {
+            let sym = x
+                .get("symbol")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| ExecutionError::Broker("position missing symbol field".into()))?
+                .to_string();
+            let qty: i32 = x
+                .get("qty")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| ExecutionError::Broker(format!("position {sym} missing or invalid qty")))?;
+            let avg_price: f64 = x
+                .get("avg_entry_price")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| {
+                    ExecutionError::Broker(format!("position {sym} missing or invalid avg_entry_price"))
+                })?;
+            let mark: f64 = x
+                .get("current_price")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<f64>().ok())
+                .filter(|v| v.is_finite() && *v >= 0.0)
+                .ok_or_else(|| {
+                    ExecutionError::Broker(format!("position {sym} missing or invalid current_price mark"))
+                })?;
+            positions.push(Position {
+                qty,
+                avg_price,
+                mark,
+                opened_at: Utc::now(),
+                contract: th_domain::OptionContract::from_occ(&sym),
+                symbol: sym,
+            });
+        }
+        Ok(positions)
     }
     async fn clock(&self) -> Result<MarketClock, ExecutionError> {
         let url = format!("{}/v2/clock", self.base_url.trim_end_matches('/'));
@@ -656,16 +736,19 @@ impl Broker for AlpacaBroker {
             .json()
             .await
             .map_err(|e| ExecutionError::Broker(e.to_string()))?;
-        let parse = |k: &str| {
+        let parse = |k: &str| -> Result<f64, ExecutionError> {
             x.get(k)
                 .and_then(|v| v.as_str())
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0.0)
+                .and_then(|s| s.parse::<f64>().ok())
+                .filter(|v| v.is_finite())
+                .ok_or_else(|| {
+                    ExecutionError::Broker(format!("missing or invalid account financial field: {k}"))
+                })
         };
         Ok(AccountSnapshot {
-            equity: parse("equity"),
-            cash: parse("cash"),
-            buying_power: parse("buying_power"),
+            equity: parse("equity")?,
+            cash: parse("cash")?,
+            buying_power: parse("buying_power")?,
         })
     }
     async fn list_open_orders(&self) -> Result<Vec<BrokerOrder>, ExecutionError> {
@@ -701,6 +784,10 @@ impl Broker for AlpacaBroker {
                         .parse()
                         .map_err(|_| ExecutionError::Broker("invalid filled_qty".into()))?,
                     filled_avg_price: x.filled_avg_price.and_then(|v| v.parse().ok()),
+                    symbol: x.symbol,
+                    qty: x.qty.and_then(|q| q.parse().ok()),
+                    side: x.side.as_deref().and_then(parse_side),
+                    limit_price: x.limit_price.and_then(|p| p.parse().ok()),
                 })
             })
             .collect()
@@ -875,34 +962,59 @@ impl<B: Broker> ExecutionEngine<B> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuantityMismatch {
+    pub symbol: String,
+    pub internal_qty: i32,
+    pub broker_qty: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReconciliationReport {
     pub matched: bool,
     pub internal_count: usize,
     pub broker_count: usize,
     pub missing_internal: Vec<String>,
     pub missing_broker: Vec<String>,
+    #[serde(default)]
+    pub quantity_mismatches: Vec<QuantityMismatch>,
 }
 pub fn reconcile_positions(internal: &[Position], broker: &[Position]) -> ReconciliationReport {
-    let i: HashMap<_, _> = internal.iter().map(|p| (&p.symbol, p.qty)).collect();
-    let b: HashMap<_, _> = broker.iter().map(|p| (&p.symbol, p.qty)).collect();
+    let mut i: HashMap<String, i32> = HashMap::new();
+    for p in internal {
+        *i.entry(p.symbol.clone()).or_insert(0) += p.qty;
+    }
+    let mut b: HashMap<String, i32> = HashMap::new();
+    for p in broker {
+        *b.entry(p.symbol.clone()).or_insert(0) += p.qty;
+    }
     let mut mi = Vec::new();
     let mut mb = Vec::new();
-    for k in i.keys() {
-        if !b.contains_key(k) || i[k] != b[k] {
-            mi.push((*k).clone())
+    let mut qm = Vec::new();
+    for (k, i_qty) in &i {
+        match b.get(k) {
+            None => mi.push(k.clone()),
+            Some(&b_qty) if *i_qty != b_qty => {
+                qm.push(QuantityMismatch {
+                    symbol: k.clone(),
+                    internal_qty: *i_qty,
+                    broker_qty: b_qty,
+                });
+            }
+            _ => {}
         }
     }
     for k in b.keys() {
         if !i.contains_key(k) {
-            mb.push((*k).clone())
+            mb.push(k.clone());
         }
     }
     ReconciliationReport {
-        matched: mi.is_empty() && mb.is_empty(),
+        matched: mi.is_empty() && mb.is_empty() && qm.is_empty(),
         internal_count: i.len(),
         broker_count: b.len(),
         missing_internal: mi,
         missing_broker: mb,
+        quantity_mismatches: qm,
     }
 }
 
@@ -926,10 +1038,10 @@ mod tests {
         pos1_diff.qty = 3;
         let rep2 = reconcile_positions(std::slice::from_ref(&pos1), &[pos1_diff]);
         assert!(!rep2.matched);
-        assert_eq!(
-            rep2.missing_internal,
-            vec!["SPY260904C00500000".to_string()]
-        );
+        assert_eq!(rep2.quantity_mismatches.len(), 1);
+        assert_eq!(rep2.quantity_mismatches[0].symbol, "SPY260904C00500000");
+        assert_eq!(rep2.quantity_mismatches[0].internal_qty, 2);
+        assert_eq!(rep2.quantity_mismatches[0].broker_qty, 3);
 
         // Broker has extra position
         let rep3 = reconcile_positions(std::slice::from_ref(&pos1), &[pos1.clone(), pos2.clone()]);

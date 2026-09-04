@@ -17,6 +17,7 @@ th-backtest={path="../backtest"}
 th-deployment={path="../deployment"}
 th-memory={path="../memory"}
 th-storage={path="../storage"}
+th-options-data={path="../options-data"}
 
 [dev-dependencies]
 th-market-data={path="../market-data", features=["test-utils"]}

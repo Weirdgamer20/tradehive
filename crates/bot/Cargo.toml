@@ -19,6 +19,7 @@ th-risk={path="../risk"}
 th-execution={path="../execution"}
 th-storage={path="../storage"}
 th-hive={path="../hive"}
+th-options-data={path="../options-data"}
 
 th-intelligence={path="../intelligence"}
 th-memory={path="../memory"}

@@ -22,6 +22,10 @@ pub struct OpenTradeRecord {
     /// failed (process-level exit remains the safety net in that case).
     #[serde(default)]
     pub protective_order_id: Option<String>,
+    #[serde(default)]
+    pub client_order_id: Option<String>,
+    #[serde(default)]
+    pub entry_state: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -116,6 +120,16 @@ impl Store {
                 "protective_order_id",
                 "ALTER TABLE open_trades ADD COLUMN protective_order_id TEXT",
             ),
+            (
+                "open_trades",
+                "client_order_id",
+                "ALTER TABLE open_trades ADD COLUMN client_order_id TEXT",
+            ),
+            (
+                "open_trades",
+                "entry_state",
+                "ALTER TABLE open_trades ADD COLUMN entry_state TEXT",
+            ),
         ] {
             let exists = self
                 .conn
@@ -170,7 +184,7 @@ impl Store {
     }
     pub fn open_trade(&self, trade: &OpenTradeRecord) -> Result<(), StorageError> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO open_trades(symbol,underlying,strategy_id,entry_price,entry_ts,stop_loss_pct,take_profit_pct,qty,protective_order_id) VALUES(?,?,?,?,?,?,?,?,?)",
+            "INSERT OR REPLACE INTO open_trades(symbol,underlying,strategy_id,entry_price,entry_ts,stop_loss_pct,take_profit_pct,qty,protective_order_id,client_order_id,entry_state) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
             params![
                 trade.symbol,
                 trade.underlying,
@@ -180,7 +194,9 @@ impl Store {
                 trade.stop_loss_pct,
                 trade.take_profit_pct,
                 trade.qty,
-                trade.protective_order_id
+                trade.protective_order_id,
+                trade.client_order_id,
+                trade.entry_state,
             ],
         )?;
         Ok(())
@@ -192,7 +208,7 @@ impl Store {
     }
     pub fn load_open_trades(&self) -> Result<Vec<OpenTradeRecord>, StorageError> {
         let mut st = self.conn.prepare(
-            "SELECT symbol,underlying,strategy_id,entry_price,entry_ts,stop_loss_pct,take_profit_pct,qty,protective_order_id FROM open_trades",
+            "SELECT symbol,underlying,strategy_id,entry_price,entry_ts,stop_loss_pct,take_profit_pct,qty,protective_order_id,client_order_id,entry_state FROM open_trades",
         )?;
         let rows = st.query_map([], |r| {
             Ok(OpenTradeRecord {
@@ -205,6 +221,8 @@ impl Store {
                 take_profit_pct: r.get(6)?,
                 qty: r.get(7)?,
                 protective_order_id: r.get(8)?,
+                client_order_id: r.get(9)?,
+                entry_state: r.get(10)?,
             })
         })?;
         let mut out = Vec::new();

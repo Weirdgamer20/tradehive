@@ -59,6 +59,44 @@ impl OptionChain {
             .collect()
     }
 }
+
+impl From<&th_domain::OptionChain> for OptionChain {
+    fn from(c: &th_domain::OptionChain) -> Self {
+        let spot = c.quotes.first().map(|q| q.strike).unwrap_or(100.0);
+        Self {
+            underlying: c.underlying.clone(),
+            spot,
+            as_of: c.as_of,
+            quotes: c.quotes.iter().map(OptionQuote::from).collect(),
+        }
+    }
+}
+
+impl From<&th_domain::OptionQuote> for OptionQuote {
+    fn from(q: &th_domain::OptionQuote) -> Self {
+        Self {
+            symbol: q.symbol.clone(),
+            underlying: q.underlying.clone(),
+            option_type: q.option_type,
+            strike: q.strike,
+            expiry: q.expiry,
+            bid: q.bid,
+            ask: q.ask,
+            last: Some(q.last),
+            volume: q.volume,
+            open_interest: q.open_interest,
+            iv: Some(q.iv),
+            greeks: q.greeks.as_ref().map(|g| OptionGreeks {
+                delta: g.delta,
+                gamma: g.gamma,
+                theta: g.theta,
+                vega: g.vega,
+                rho: g.rho,
+            }),
+            as_of: q.quote_ts,
+        }
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OptionGreeks {
     pub delta: f64,

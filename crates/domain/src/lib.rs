@@ -493,11 +493,15 @@ pub struct OptionContract {
 
 impl OptionContract {
     pub fn from_occ(symbol: &str) -> Option<Self> {
+        use chrono::TimeZone;
         let parsed = occ::parse(symbol)?;
         let naive_date =
             chrono::NaiveDate::from_ymd_opt(parsed.year as i32, parsed.month, parsed.day)?;
-        let naive_dt = naive_date.and_hms_opt(20, 0, 0)?; // 4 PM ET expiration
-        let expiry = DateTime::from_naive_utc_and_offset(naive_dt, Utc);
+        let naive_dt = naive_date.and_hms_opt(16, 0, 0)?; // 4:00 PM Eastern Time expiration
+        let expiry = chrono_tz::America::New_York
+            .from_local_datetime(&naive_dt)
+            .single()?
+            .with_timezone(&Utc);
         Some(Self {
             symbol: symbol.to_string(),
             underlying: parsed.underlying,

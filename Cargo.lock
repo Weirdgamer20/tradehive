@@ -1341,6 +1341,7 @@ dependencies = [
  "th-domain",
  "th-market-data",
  "th-memory",
+ "th-options-data",
  "th-storage",
  "th-strategy",
  "thiserror",
