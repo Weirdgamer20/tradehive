@@ -119,25 +119,61 @@ impl RiskLimits {
         Ok(())
     }
 }
+pub fn underlying_from_symbol(symbol: &str) -> String {
+    th_domain::OptionContract::from_occ(symbol)
+        .map(|c| c.underlying)
+        .unwrap_or_else(|| symbol.to_string())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PortfolioRisk {
     pub cash: f64,
     pub realized_today: f64,
     pub positions: Vec<Position>,
+    #[serde(default)]
+    pub open_orders: Vec<OrderIntent>,
 }
 impl PortfolioRisk {
+    pub fn new(cash: f64, realized_today: f64, positions: Vec<Position>) -> Self {
+        Self {
+            cash,
+            realized_today,
+            positions,
+            open_orders: Vec::new(),
+        }
+    }
+    pub fn with_open_orders(mut self, orders: Vec<OrderIntent>) -> Self {
+        self.open_orders = orders;
+        self
+    }
     pub fn total_notional(&self) -> f64 {
-        self.positions
+        let pos_notional: f64 = self.positions
             .iter()
             .map(|p| p.mark.abs() * p.qty.unsigned_abs() as f64 * CONTRACT_MULTIPLIER)
-            .sum()
+            .sum();
+        let orders_notional: f64 = self.open_orders
+            .iter()
+            .filter(|o| !o.reduce_only)
+            .map(|o| o.qty as f64 * o.limit_price.unwrap_or(0.0) * CONTRACT_MULTIPLIER)
+            .sum();
+        pos_notional + orders_notional
+    }
+    pub fn underlying_notional(&self, symbol_or_underlying: &str) -> f64 {
+        let target = underlying_from_symbol(symbol_or_underlying);
+        let pos_notional: f64 = self.positions
+            .iter()
+            .filter(|p| underlying_from_symbol(&p.symbol) == target)
+            .map(|p| p.mark.abs() * p.qty.unsigned_abs() as f64 * CONTRACT_MULTIPLIER)
+            .sum();
+        let orders_notional: f64 = self.open_orders
+            .iter()
+            .filter(|o| !o.reduce_only && underlying_from_symbol(&o.symbol) == target)
+            .map(|o| o.qty as f64 * o.limit_price.unwrap_or(0.0) * CONTRACT_MULTIPLIER)
+            .sum();
+        pos_notional + orders_notional
     }
     pub fn symbol_notional(&self, symbol: &str) -> f64 {
-        self.positions
-            .iter()
-            .filter(|p| p.symbol == symbol)
-            .map(|p| p.mark.abs() * p.qty.unsigned_abs() as f64 * CONTRACT_MULTIPLIER)
-            .sum()
+        self.underlying_notional(symbol)
     }
     pub fn open_positions(&self) -> u32 {
         self.positions.iter().filter(|p| p.qty != 0).count() as u32
@@ -278,12 +314,26 @@ impl RiskGovernor {
             return Err(RiskError::Limit("MAX_TOTAL_NOTIONAL".into()));
         }
         if !order.reduce_only
-            && portfolio.symbol_notional(&order.symbol) + n > self.limits.max_symbol_exposure
+            && portfolio.underlying_notional(&order.symbol) + n > self.limits.max_symbol_exposure
         {
             return Err(RiskError::Limit("MAX_SYMBOL_EXPOSURE".into()));
         }
         if !order.reduce_only && portfolio.open_positions() >= self.limits.max_positions {
             return Err(RiskError::Limit("MAX_POSITIONS".into()));
+        }
+        // E3: Enforce loss-at-risk against max_trade_risk_pct
+        let equity = portfolio.cash + portfolio.total_notional();
+        if equity > 0.0 && !order.reduce_only {
+            let max_trade_loss = equity * self.limits.max_trade_risk_pct;
+            let stop_fraction = self
+                .strategy_risks
+                .get(&order.strategy_id)
+                .map(|s| s.risk_pct)
+                .unwrap_or(0.20);
+            let proposed_loss = n * stop_fraction;
+            if proposed_loss > max_trade_loss {
+                return Err(RiskError::Limit("MAX_TRADE_RISK_EXCEEDED".into()));
+            }
         }
         if portfolio.realized_today <= -self.limits.max_daily_loss {
             return Err(RiskError::Limit("DAILY_LOSS".into()));
@@ -417,6 +467,7 @@ mod tests {
             cash: 10_000.0,
             realized_today: 0.0,
             positions: vec![],
+            open_orders: vec![],
         };
         assert!(gov
             .authorize(&valid_order, 4.0, 50.0, &normal_portfolio)
@@ -436,9 +487,30 @@ mod tests {
             cash: 10_000.0,
             realized_today: -150.0, // Exceeds max_daily_loss 100.0
             positions: vec![],
+            open_orders: vec![],
         };
         assert!(gov
             .authorize(&valid_order, 4.0, 50.0, &loss_portfolio)
+            .is_err());
+
+        // Underlying exposure check across different strikes/expiries for same underlying
+        let pos_same_underlying = th_domain::Position {
+            symbol: "SPY260904P00490000".into(),
+            qty: 2,
+            avg_price: 4.0,
+            mark: 4.0,
+            opened_at: Utc::now(),
+            contract: th_domain::OptionContract::from_occ("SPY260904P00490000"),
+        };
+        let exposure_portfolio = PortfolioRisk {
+            cash: 10_000.0,
+            realized_today: 0.0,
+            positions: vec![pos_same_underlying], // 2 * 4.0 * 100 = 800
+            open_orders: vec![],
+        };
+        // Order notional is 1 * 4.0 * 100 = 400. 800 + 400 = 1200 > max_symbol_exposure (1000)
+        assert!(gov
+            .authorize(&valid_order, 4.0, 50.0, &exposure_portfolio)
             .is_err());
     }
 

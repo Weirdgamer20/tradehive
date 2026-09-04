@@ -336,6 +336,7 @@ fn test_portfolio_concentration_and_daily_drawdown_halt() {
         cash: 10_000.0,
         realized_today: -600.0, // Exceeds max_daily_loss = 500.0
         positions: vec![],
+        open_orders: vec![],
     };
     let order = OrderIntent {
         client_order_id: Uuid::new_v4(),

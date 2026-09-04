@@ -130,6 +130,13 @@ impl QLearning {
             })
             .cloned()
     }
+    pub fn unique_actions(&self) -> Vec<String> {
+        let mut set = std::collections::BTreeSet::new();
+        for ((_, action), _) in &self.q {
+            set.insert(action.clone());
+        }
+        set.into_iter().collect()
+    }
     pub fn update(&mut self, e: &Experience) {
         let old = *self
             .q
@@ -839,15 +846,14 @@ pub fn run_analysis_with_q(bars: &[Bar], prior: Option<QLearning>) -> AnalysisRe
                         continue;
                     }
                     let r = bars[i + 1].close / bars[i].close - 1.0;
-                    // Realistic option delta (0.50), friction (15 bps), and theta decay (-5 bps/bar)
-                    let delta = 0.50;
-                    let friction_and_theta = 0.0020;
-                    let option_return = match sig.side {
-                        SignalSide::LongCall => r * delta - friction_and_theta,
-                        SignalSide::LongPut => -r * delta - friction_and_theta,
+                    // Research training signal: uses directional underlying bar return as proxy.
+                    // (Live RL reward uses actual realized option fill P&L in BotRuntime).
+                    let directional_return = match sig.side {
+                        SignalSide::LongCall => r,
+                        SignalSide::LongPut => -r,
                         SignalSide::Flat => 0.0,
                     };
-                    let reward = option_return.clamp(-0.10, 0.10);
+                    let reward = directional_return.clamp(-0.10, 0.10);
                     let exp = Experience {
                         state: state.clone(),
                         action: actions[idx].clone(),

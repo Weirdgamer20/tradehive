@@ -26,6 +26,18 @@ pub use sizing::*;
 pub mod supervisor;
 pub use supervisor::*;
 
+pub fn protective_client_order_id(symbol: &str, session_id: &str) -> Uuid {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(format!("PROTECTIVE:{}:{}", symbol, session_id).as_bytes());
+    let hash = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&hash[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeConfig {
     pub analysis_start_hour: u32,
@@ -578,22 +590,20 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
         let state = classify_regime(&snapshot);
         self.manage_open_trade(&candle.symbol, &state).await?;
         // Consult the live Q-policy to determine the preferred action for the current regime.
-        // The Q-policy suppresses or permits buy/sell signals; it does NOT bypass risk controls.
+        // The Q-policy suppresses or permits signals based on learned strategy performance; it does NOT bypass risk controls.
         let state_key = th_hive::StateKey::from_state(&state);
+        let available_actions: Vec<String> = self
+            .q_policy
+            .as_ref()
+            .map(|q| q.unique_actions())
+            .unwrap_or_default();
         let q_action = self.q_policy.as_mut().and_then(|q| {
-            q.choose(
-                &state_key,
-                &[
-                    "Buy".to_string(),
-                    "Sell".to_string(),
-                    "Hold".to_string(),
-                    "Exit".to_string(),
-                ],
-            )
+            if available_actions.is_empty() {
+                None
+            } else {
+                q.choose(&state_key, &available_actions)
+            }
         });
-        let q_permits_buy = q_action.as_deref() != Some("Hold")
-            && q_action.as_deref() != Some("Exit")
-            && q_action.as_deref() != Some("Sell");
         let mut signals = Vec::new();
         // Strategy-to-bot routing: evaluate only strategies assigned to active bots for this symbol
         let assigned_strategies: Vec<String> = self
@@ -612,12 +622,17 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
         for strategy in self.strategies.iter_mut() {
             if assigned_strategies.contains(&strategy.spec().id) {
                 if let Some(sig) = strategy.update(&candle, &state) {
-                    // Gate long entries by Q-policy. Short/flat signals always pass through.
+                    // Gate long entries by Q-policy. If Q-policy has a preferred strategy for this state,
+                    // prioritize it; if no action is trained yet, allow signals through to discovery.
                     let is_long_entry = matches!(
                         sig.side,
                         th_domain::SignalSide::LongCall | th_domain::SignalSide::LongPut
                     );
-                    if is_long_entry && !q_permits_buy {
+                    let q_permits = match &q_action {
+                        Some(preferred) => preferred == &sig.strategy_id,
+                        None => true,
+                    };
+                    if is_long_entry && !q_permits {
                         println!(
                             "SIGNAL_SUPPRESSED_BY_Q symbol={} strategy_id={} side={:?} q_action={:?}",
                             sig.symbol, sig.strategy_id, sig.side, q_action
@@ -927,6 +942,7 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                     cash: acct.cash,
                     realized_today: self.daily_realized,
                     positions: broker_positions,
+                    open_orders: vec![],
                 };
                 let mut order = OrderIntent {
                     client_order_id: Uuid::new_v4(),
@@ -1296,6 +1312,7 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
             cash: acct.cash,
             realized_today: self.daily_realized,
             positions,
+            open_orders: vec![],
         };
 
         // Compute volatility/ATR from bar history or option implied volatility
@@ -1685,6 +1702,68 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
             .positions()
             .await
             .map_err(|e| RuntimeError::Execution(e.to_string()))?;
+        // F2: Check if any open trades were closed by protective order fills at broker
+        let trades_to_check: Vec<(String, OpenTrade)> = self
+            .open_trades
+            .iter()
+            .filter(|(_, t)| t.protective_order_id.is_some())
+            .map(|(k, t)| (k.clone(), t.clone()))
+            .collect();
+        for (key, t) in trades_to_check {
+            if let Some(ref pid) = t.protective_order_id {
+                if let Ok(pbo) = self.execution.broker_ref().get_order(pid).await {
+                    if matches!(pbo.status, th_domain::OrderStatus::Filled) {
+                        let fp = pbo.filled_avg_price.unwrap_or(t.entry_price);
+                        let pnl = (fp - t.entry_price) * pbo.filled_qty as f64 * 100.0;
+                        self.daily_realized += pnl;
+                        let _ = self.store.checkpoint(
+                            &format!("daily_realized:{}", self.daily_key),
+                            &self.daily_realized.to_string(),
+                        );
+                        self.stats.realized_pnl += pnl;
+                        self.stats.trades_closed += 1;
+                        let fill = th_domain::Fill {
+                            fill_id: Uuid::new_v4(),
+                            client_order_id: Uuid::new_v4(),
+                            broker_order_id: pid.clone(),
+                            symbol: t.symbol.clone(),
+                            side: OrderSide::Sell,
+                            qty: pbo.filled_qty,
+                            price: fp,
+                            fee: 0.0,
+                            ts: Utc::now(),
+                        };
+                        let _ = self.store.fill(&fill);
+                        let trade = TradeRecord {
+                            trade_id: format!("TRADE-RECONCILED-PROTECTIVE-{}", t.symbol),
+                            symbol: t.underlying.clone(),
+                            strategy_id: t.strategy_id.clone(),
+                            session_id: self.current_session_id.clone().unwrap_or_default(),
+                            entry: t.entry_ts,
+                            exit: Some(Utc::now()),
+                            pnl,
+                            fees: 0.0,
+                            reason: "protective_order_filled_during_reconciliation".into(),
+                            signal_price: Some(t.entry_price),
+                            quote_spread_bps: None,
+                            entry_fill_price: Some(t.entry_price),
+                            exit_fill_price: Some(fp),
+                            slippage_bps: None,
+                            latency_ms: None,
+                            regime_at_entry: None,
+                        };
+                        self.experience.record_trade(trade);
+                        self.open_trades.remove(&key);
+                        let _ = self.store.delete_open_trade(&key);
+                        println!(
+                            "RECONCILIATION_INGESTED_PROTECTIVE_CLOSE symbol={} fill_price={:.2} pnl={:.2}",
+                            t.symbol, fp, pnl
+                        );
+                    }
+                }
+            }
+        }
+
         let internal = self
             .open_trades
             .values()
@@ -2564,6 +2643,7 @@ impl<B: Broker, P: MarketDataProvider> TradingRuntime<B, P> {
                 cash: acct.cash,
                 realized_today: self.daily_realized,
                 positions: broker_positions,
+                open_orders: vec![],
             };
             let mut order = OrderIntent {
                 client_order_id: Uuid::new_v4(),
